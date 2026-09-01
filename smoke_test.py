@@ -27,6 +27,27 @@ async def rpc_call(method, plugin_id, payload, timeout_ms=None):
     if cap == "send.image":
         SENT.append(("image", f"<{len(args.get('image_base64',''))} chars b64>"))
         return True
+    if cap == "send.forward":
+        nodes = args.get("messages") or []
+        # 校验 Host 端（_cap_send_forward）要求的节点结构：
+        # 每个节点 dict 必须带 nickname/user_id/segments（非空）
+        for n in nodes:
+            assert isinstance(n, dict) and n.get("segments"), f"forward 节点缺少 segments: {n}"
+            assert "nickname" in n or "user_nickname" in n, f"forward 节点缺少 nickname: {n}"
+            for seg in n["segments"]:
+                assert seg.get("type") in ("text", "image"), f"非法段类型: {seg}"
+                assert seg.get("content"), f"段缺少 content: {seg.get('type')}"
+        desc = ",".join(
+            f"{n.get('nickname', '?')}:{'+'.join(s['type'] for s in n['segments'])}" for n in nodes
+        )
+        SENT.append(("forward", f"<{len(nodes)} nodes: {desc}>"))
+        return True
+    if cap == "send.hybrid":
+        segs = args.get("segments") or []
+        SENT.append(
+            ("hybrid", f"<{len(segs)} segs: " + ",".join(s.get("type", "?") for s in segs) + ">")
+        )
+        return True
     if cap == "chat.open_session":
         return {"stream_id": f"stream-group-{args.get('group_id')}"}
     if cap.startswith("config."):
@@ -367,10 +388,279 @@ async def main():
     )
     plug._client.fetch_dynamics = orig_fetch
     plug._download_image_b64 = orig_dl
+    # 私聊 test 只有 1 张图：不超阈值（默认 2），走逐条 text+image
     kinds = [s[0] for s in SENT]
     assert "text" in kinds and "image" in kinds, f"私聊测试应发文本+图片: {SENT}"
     assert "私聊测试动态" in r[1], r[1]
     print(f"  -> 私聊 test 发送了 {kinds}")
+
+    print("== 多图合并：>2 张走 send.forward 转发卡片，<=2 张保持逐条 ==")
+    # 用户需求：多图逐张发会刷屏，超过 2 张时合并为 QQ 合并转发卡片
+    merge_item = {
+        "id_str": "888",
+        "type": "DYNAMIC_TYPE_DRAW",
+        "modules": {
+            "module_author": {"name": "测试UP", "pub_ts": 1700000000},
+            "module_dynamic": {
+                "desc": {"text": "九图动态"},
+                "major": {
+                    "type": "MAJOR_TYPE_DRAW",
+                    "draw": {"items": [{"src": f"http://img/{i}.jpg"} for i in range(9)]},
+                },
+            },
+        },
+    }
+    pm = parse_dynamic(merge_item)
+    assert pm and len(pm["images"]) == 9, pm
+
+    orig_dl2 = plug._download_image_b64
+    plug._download_image_b64 = stub_dl  # type: ignore[assignment]
+
+    # ① 默认阈值 2：9 张图（max_images 默认 9 不截断）
+    #    -> 1 条 forward 转发卡片（1 文本节点 + 9 图片节点），节点昵称 = UP 主名
+    SENT.clear()
+    await plug._push_dynamic("114514", merge_item, [12345])
+    kinds = [s[0] for s in SENT]
+    assert kinds == ["forward"], f"9 图应只发 1 条 forward 转发卡片: {SENT}"
+    assert SENT[0][1] == (
+        "<10 nodes: 测试UP:text,测试UP:image,测试UP:image,测试UP:image,"
+        "测试UP:image,测试UP:image,测试UP:image,测试UP:image,测试UP:image,测试UP:image>"
+    ), f"forward 应为文字+9图共10节点，昵称=UP主名: {SENT[0][1]}"
+
+    # ② 2 张图（不超阈值）-> 文字一条 + 图片逐张
+    two_img = dict(merge_item)
+    two_img["modules"] = {
+        "module_author": merge_item["modules"]["module_author"],
+        "module_dynamic": {
+            "desc": {"text": "双图动态"},
+            "major": {
+                "type": "MAJOR_TYPE_DRAW",
+                "draw": {"items": [{"src": "http://img/a.jpg"}, {"src": "http://img/b.jpg"}]},
+            },
+        },
+    }
+    SENT.clear()
+    await plug._push_dynamic("114514", two_img, [12345])
+    kinds = [s[0] for s in SENT]
+    assert kinds == ["text", "image", "image"], f"2 图应保持逐条: {SENT}"
+
+    # ③ 纯图无文字（>2 张，max_images=9 不截断）-> 单条 forward（text+9 image 节点）
+    no_text_9 = dict(merge_item)
+    no_text_9["modules"] = {
+        "module_author": merge_item["modules"]["module_author"],
+        "module_dynamic": {
+            "desc": {"text": ""},
+            "major": {
+                "type": "MAJOR_TYPE_DRAW",
+                "draw": {"items": [{"src": f"http://img/{i}.jpg"} for i in range(9)]},
+            },
+        },
+    }
+    SENT.clear()
+    await plug._push_dynamic("114514", no_text_9, [12345])
+    kinds = [s[0] for s in SENT]
+    # 纯配图动态正文为空，但模板仍渲染 {name} 头部行，text 节点非空
+    assert kinds == ["forward"] and SENT[0][1].startswith("<10 nodes: "), (
+        f"纯图 9 张应合并为单条 forward: {SENT}"
+    )
+
+    # ④ 阈值改 999（从不合并）-> 恢复逐条；阈值 0（总是合并）-> 1 张也合并
+    plug.config.settings.hybrid_merge_threshold = 999
+    SENT.clear()
+    await plug._push_dynamic("114514", two_img, [12345])
+    assert [s[0] for s in SENT] == ["text", "image", "image"], f"阈值 999 不应合并: {SENT}"
+
+    plug.config.settings.hybrid_merge_threshold = 0
+    one_img = dict(two_img)
+    SENT.clear()
+    await plug._push_dynamic("114514", one_img, [12345])
+    assert [s[0] for s in SENT] == ["forward"], f"阈值 0 应始终合并: {SENT}"
+
+    # ⑤ forward 失败自动降级为 hybrid（协议端不支持转发卡片时）
+    plug.config.settings.hybrid_merge_threshold = 2
+    orig_forward = plug.ctx.send.forward
+
+    async def broken_forward(messages, stream_id, **kw):
+        raise RuntimeError("E_CAPABILITY_DENIED: 模拟协议端不支持 forward")
+
+    plug.ctx.send.forward = broken_forward  # type: ignore[method-assign]
+    SENT.clear()
+    await plug._push_dynamic("114514", merge_item, [12345])
+    assert [s[0] for s in SENT] == ["hybrid"], (
+        f"forward 失败应降级为 hybrid: {SENT}"
+    )
+    plug.ctx.send.forward = orig_forward  # type: ignore[method-assign]
+
+    # ⑥ forward + hybrid 都失败 -> 逐条发送（最终兜底）
+    plug.ctx.send.forward = broken_forward  # type: ignore[method-assign]
+    orig_hybrid = plug.ctx.send.hybrid
+
+    async def broken_hybrid(segments, stream_id, **kw):
+        raise RuntimeError("E_CAPABILITY_DENIED: 模拟协议端不支持 hybrid")
+
+    plug.ctx.send.hybrid = broken_hybrid  # type: ignore[method-assign]
+    try:
+        SENT.clear()
+        await plug._push_dynamic("114514", merge_item, [12345])
+        kinds = [s[0] for s in SENT]
+        assert kinds and kinds[0] == "text" and kinds.count("image") == 9, (
+            f"forward+hybrid 均失败应降级为 text+9 图(max_images=9): {SENT}"
+        )
+    finally:
+        plug.ctx.send.forward = orig_forward  # type: ignore[method-assign]
+        plug.ctx.send.hybrid = orig_hybrid  # type: ignore[method-assign]
+    plug._download_image_b64 = orig_dl2
+    print("  -> >2 张 forward 卡片、失败降级 hybrid、再降级逐条、阈值可调")
+
+    print("== 帧体积防线：合并 payload 超过 RPC 帧上限不尝试合并，直接逐条 ==")
+    # 真机实测：9 张大图 base64 合计约 36MB，超过 msgpack 帧上限 16MB，
+    # send.hybrid / send.forward 必报 E_UNKNOWN 帧超限——发送前就应预判
+    SENT.clear()
+    orig_dl3 = plug._download_image_b64
+    forward_calls: list[int] = []
+    hybrid_calls: list[int] = []
+
+    async def big_dl(url: str) -> str:
+        return "A" * (4 * 1024 * 1024)  # 每张 4MB，9 张 36MB > 安全线 11MB
+
+    async def counting_forward(messages, stream_id, **kw):
+        forward_calls.append(1)
+        raise RuntimeError("不应被调用：体积超限应直接跳过合并")
+
+    async def counting_hybrid(segments, stream_id, **kw):
+        hybrid_calls.append(1)
+        raise RuntimeError("不应被调用：体积超限应直接跳过合并")
+
+    plug._download_image_b64 = big_dl  # type: ignore[assignment]
+    orig_forward2 = plug.ctx.send.forward
+    orig_hybrid2 = plug.ctx.send.hybrid
+    plug.ctx.send.forward = counting_forward  # type: ignore[method-assign]
+    plug.ctx.send.hybrid = counting_hybrid  # type: ignore[method-assign]
+    try:
+        await plug._push_dynamic("114514", merge_item, [12345])
+    finally:
+        plug.ctx.send.forward = orig_forward2  # type: ignore[method-assign]
+        plug.ctx.send.hybrid = orig_hybrid2  # type: ignore[method-assign]
+        plug._download_image_b64 = orig_dl3
+    assert not forward_calls and not hybrid_calls, "体积超限不应尝试 forward/hybrid"
+    kinds = [s[0] for s in SENT]
+    assert kinds and kinds[0] == "text" and kinds.count("image") == 9, (
+        f"体积超限应直接逐条发送 text+9 图: {SENT}"
+    )
+
+    # 反向：小图（每张 1MB，9 张 9MB < 11MB 安全线）仍应尝试 forward 合并
+    SENT.clear()
+    forward_calls.clear()
+
+    async def small_dl(url: str) -> str:
+        return "A" * (1024 * 1024)
+
+    plug._download_image_b64 = small_dl  # type: ignore[assignment]
+    plug.ctx.send.forward = counting_forward  # type: ignore[method-assign]
+    try:
+        await plug._push_dynamic("114514", merge_item, [12345])
+    finally:
+        plug.ctx.send.forward = orig_forward2  # type: ignore[method-assign]
+        plug._download_image_b64 = orig_dl3
+    assert forward_calls, "小图体积在安全线内应尝试 send.forward"
+    print("  -> 36MB 原图超线；9MB 正常走 forward 合并")
+
+    print("== 大图压缩防线（v1.3.1）：超安全线先压缩再合并 ==")
+    # 真机实测（hanser 9 图 35.2MB）：原图超线直接逐条会刷屏 10 条，
+    # v1.3.1 起先 Pillow 压缩（长边 1080 + JPEG q85），压进安全线就继续合并
+    import io
+
+    from PIL import Image as PILImage
+
+    def _make_jpeg_b64(w: int, h: int, color=(120, 40, 200)) -> str:
+        import base64 as _b64
+
+        img = PILImage.new("RGB", (w, h), color)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=95)
+        return _b64.b64encode(buf.getvalue()).decode("ascii")
+
+    compress_calls: list[int] = []
+
+    async def huge_real_jpeg_dl(url: str) -> str:
+        # 3000x3000 纯色 JPEG 约 100KB 级，但 base64 长度可控——
+        # 为了让原图合计 >11MB，用大尺寸+高噪声图片
+        img = PILImage.effect_noise((3000, 3000), 30).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=98)
+        data = buf.getvalue()
+        assert len(data) * 9 > 11 * 1024 * 1024, f"测试图太小: {len(data)}"
+        import base64 as _b64
+
+        return _b64.b64encode(data).decode("ascii")
+
+    orig_compress = plug._compress_images_for_frame
+
+    async def spy_compress(b64s, *, where):
+        compress_calls.append(1)
+        return await orig_compress(b64s, where=where)
+
+    plug._compress_images_for_frame = spy_compress  # type: ignore[method-assign]
+    plug._download_image_b64 = huge_real_jpeg_dl  # type: ignore[assignment]
+    SENT.clear()
+    forward_calls.clear()
+    plug.ctx.send.forward = counting_forward  # type: ignore[method-assign]
+    try:
+        await plug._push_dynamic("114514", merge_item, [12345])
+    finally:
+        plug.ctx.send.forward = orig_forward2  # type: ignore[method-assign]
+        plug._download_image_b64 = orig_dl3
+        plug._compress_images_for_frame = orig_compress  # type: ignore[method-assign]
+    assert compress_calls, "超安全线应触发压缩流程"
+    assert forward_calls, "压缩进安全线后应继续尝试 forward 合并（而非逐条）"
+    print(f"  -> 9 张大图压缩后 ({compress_calls and '压缩 1 次'}) 成功走 forward 合并")
+
+    # 压缩单测：_encode_one 的行为直接验证（长边限制 / 格式 / alpha 白底合成）
+    one_big = _make_jpeg_b64(2400, 1200)
+    import base64 as _b64
+
+    compressed_one = await plug._compress_images_for_frame([one_big], where="单测")
+    assert compressed_one is not None and len(compressed_one) == 1
+    raw = _b64.b64decode(compressed_one[0])
+    assert raw[:2] == b"\xff\xd8", "压缩产物应为 JPEG"
+    im = PILImage.open(io.BytesIO(raw))
+    assert max(im.size) == 1080, f"长边应压到 1080: {im.size}"
+    # 透明 PNG -> 白底合成不报错
+    rgba = PILImage.new("RGBA", (500, 500), (0, 0, 0, 0))
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    png_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+    out2 = await plug._compress_images_for_frame([png_b64], where="单测")
+    assert out2 is not None and _b64.b64decode(out2[0])[:2] == b"\xff\xd8"
+    # 损坏输入 -> 返回 None（放弃合并，退逐条）
+    out3 = await plug._compress_images_for_frame(["bm90IGFuIGltYWdl"], where="单测")
+    assert out3 is None, "损坏图片应返回 None"
+    print("  -> 长边 1080/JPEG/alpha 白底/损坏输入返 None 全部正确")
+
+    # Pillow 缺失时：压缩返回 None -> 超线走逐条（兼容降级路径）
+    import plugin as _pm
+
+    real_bytes_total = plug.HYBRID_FRAME_SAFE_BYTES
+    SENT.clear()
+
+    async def fake_dl_small(url: str) -> str:
+        return "A" * (2 * 1024 * 1024)  # 每张 2MB，9 张 18MB > 11MB
+
+    plug._download_image_b64 = fake_dl_small  # type: ignore[assignment]
+
+    async def none_compress(b64s, *, where):
+        return None
+
+    plug._compress_images_for_frame = none_compress  # type: ignore[method-assign]
+    await plug._push_dynamic("114514", merge_item, [12345])
+    plug._compress_images_for_frame = orig_compress  # type: ignore[method-assign]
+    plug._download_image_b64 = orig_dl3  # type: ignore[assignment]
+    kinds = [s[0] for s in SENT]
+    assert kinds and kinds[0] == "text" and kinds.count("image") == 9, (
+        f"压缩不可用应退逐条: {kinds}"
+    )
+    print("  -> 压缩不可用时退逐条（Pillow 缺失兼容路径）")
+    del real_bytes_total
 
     print("== 请求头自洽性（UA/version 不一致会被 WAF 判为脚本）==")
     import re as _re

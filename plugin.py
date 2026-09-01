@@ -87,8 +87,17 @@ class SettingsSection(PluginConfigBase):
         description="轮询抖动（秒），实际间隔 = 基准 ± 抖动，防风控。",
     )
     max_images: int = Field(
-        default=3,
-        description="单条动态最多推送的图片数量。",
+        default=9,
+        description="单条动态最多推送的图片数量（B 站上限 9）。v1.2.0 起多图合并为一条消息推送，无刷屏顾虑，默认放开到上限。",
+    )
+    hybrid_merge_threshold: int = Field(
+        default=2,
+        description=(
+            "图片合并阈值：动态图片数超过该值时，文字+图片合并为一条"
+            "合并转发卡片发送（优先 send.forward，协议端不支持时自动降级"
+            "混合消息，再降级逐条发送）；不超过时保持文字一条、图片逐张发送。"
+            "设为 0 表示始终合并；设为 999 表示从不合并。"
+        ),
     )
     max_dynamic_age: int = Field(
         default=3600,
@@ -156,6 +165,11 @@ class BiliPushPlugin(MaiBotPlugin):
     """B 站动态自动推送。"""
 
     config_model = BiliPushConfig
+
+    # RPC 帧大小上限（msgpack 序列化，真机报错实测 16777216 = 16MB）。
+    # 合并消息的 segments（含全部图片 base64）必须小于该值才能走 send.hybrid；
+    # 安全线取 11MB 留足元数据与协议开销余量。超限直接逐条发送，不浪费尝试。
+    HYBRID_FRAME_SAFE_BYTES = 11 * 1024 * 1024
 
     def __init__(self):
         super().__init__()
@@ -421,6 +435,165 @@ class BiliPushPlugin(MaiBotPlugin):
         resp.raise_for_status()
         return base64.b64encode(resp.content).decode("ascii")
 
+    # 合并前的图片压缩参数：B 站动态图多为长图/高清图（单张 base64 可达 4MB），
+    # 9 张必超 RPC 帧 16MB 上限。QQ 聊天窗口显示宽度有限，压到 1080px 长边
+    # + JPEG q85 在手机上几乎无损观感，体积却能缩一个数量级。
+    COMPRESS_MAX_EDGE = 1080
+    COMPRESS_JPEG_QUALITY = 85
+
+    async def _compress_images_for_frame(
+        self, image_b64s: list[str], *, where: str
+    ) -> list[str] | None:
+        """把图片列表压缩到合并安全线内；失败返回 None（调用方退回逐条）。
+
+        策略：Pillow 重编码为 JPEG（长边限 COMPRESS_MAX_EDGE、质量
+        COMPRESS_JPEG_QUALITY）。PNG 透明图会丢 alpha（白底合成）——
+        对动态配图场景可接受。压缩在普通线程池跑，不阻塞事件循环。
+        """
+        try:
+            import io
+
+            from PIL import Image
+        except ImportError:
+            self.ctx.logger.warning(
+                "%s 未安装 Pillow（pip install Pillow），无法压缩图片，"
+                "超过安全线的多图将逐条发送", where,
+            )
+            return None
+
+        def _encode_one(raw_b64: str) -> str:
+            img = Image.open(io.BytesIO(base64.b64decode(raw_b64)))
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGBA")
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            edge = max(w, h)
+            if edge > self.COMPRESS_MAX_EDGE:
+                scale = self.COMPRESS_MAX_EDGE / edge
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=self.COMPRESS_JPEG_QUALITY, optimize=True)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+
+        def _compress_all() -> list[str]:
+            return [_encode_one(b) for b in image_b64s]
+
+        try:
+            compressed = await asyncio.to_thread(_compress_all)
+        except Exception as exc:
+            self.ctx.logger.warning("%s 图片压缩失败，放弃合并: %s", where, exc)
+            return None
+        new_total = sum(len(b) for b in compressed)
+        if new_total > self.HYBRID_FRAME_SAFE_BYTES:
+            self.ctx.logger.info(
+                "%s 压缩后仍 %dMB（原图 %.1fMB），继续用压缩图尝试合并",
+                where,
+                new_total // 1024 // 1024,
+                sum(len(b) for b in image_b64s) / 1024 / 1024,
+            )
+        self.ctx.logger.info(
+            "%s 已压缩 %d 张图：%.1fMB -> %.1fMB",
+            where,
+            len(compressed),
+            sum(len(b) for b in image_b64s) / 1024 / 1024,
+            new_total / 1024 / 1024,
+        )
+        return compressed
+
+    async def _send_dynamic_content(
+        self,
+        stream_id: str,
+        text: str,
+        image_b64s: list[str],
+        *,
+        where: str,
+        sender_name: str = "",
+    ) -> None:
+        """把一条动态的文字+图片发到指定消息流。
+
+        图片数超过 hybrid_merge_threshold 时，合并为一条消息发送，降级链：
+        1. send.forward —— QQ 合并转发卡片（"群聊的聊天记录"样式），
+           文字一条节点 + 每张图一条节点，观感最接近手动合并转发。
+        2. send.hybrid —— 单条图文混合消息（协议端不支持转发卡片时）。
+        3. 逐条发送 —— 文字一条，图片逐张（间隔 0.5s）。
+
+        帧大小防线：RPC 帧上限 16MB（msgpack，真机实测 E_UNKNOWN 帧超限），
+        合并载荷（含全部图片 base64）超过 11MB 安全线时先尝试压缩图片
+        （Pillow → JPEG 重编码，v1.3.1），压进安全线就继续走合并；
+        压不进（图太多或压缩不可用）才逐条发送。
+        """
+        if not text and not image_b64s:
+            return
+        threshold = self.config.settings.hybrid_merge_threshold
+        total_b64 = sum(len(b) for b in image_b64s) + len(text)
+        should_merge = threshold >= 0 and len(image_b64s) > threshold
+        if should_merge and total_b64 > self.HYBRID_FRAME_SAFE_BYTES:
+            # 超安全线：先压缩再合并（真机实测 hanser 9 图 35MB 逐条刷屏，
+            # 压缩到安全线内即可保住合并转发卡片的体验）
+            compressed = await self._compress_images_for_frame(image_b64s, where=where)
+            if compressed is not None:
+                image_b64s = compressed
+                total_b64 = sum(len(b) for b in image_b64s) + len(text)
+        should_merge = should_merge and total_b64 <= self.HYBRID_FRAME_SAFE_BYTES
+        if should_merge:
+            # --- 第一优先：send.forward 合并转发卡片 ---
+            # Host 端（_cap_send_forward）节点格式：
+            #   {"nickname"/"user_nickname": str, "user_id": str,
+            #    "message_id": str(缺省自动生成), "segments": [{"type","content"}]}
+            # text 段取 content/data，image 段的 content 自动进 binary_data_base64
+            forward_nodes: list[dict[str, Any]] = []
+            if text:
+                forward_nodes.append({
+                    "user_id": "",
+                    "nickname": sender_name or "B站动态",
+                    "segments": [{"type": "text", "content": text}],
+                })
+            for b64 in image_b64s:
+                forward_nodes.append({
+                    "user_id": "",
+                    "nickname": sender_name or "B站动态",
+                    "segments": [{"type": "image", "content": b64}],
+                })
+            try:
+                await self.ctx.send.forward(forward_nodes, stream_id)
+                return
+            except Exception as exc:
+                self.ctx.logger.warning(
+                    "%s 合并转发卡片发送失败，尝试混合消息: %s", where, exc
+                )
+            # --- 第二优先：send.hybrid 单条图文混合 ---
+            segments: list[dict[str, str]] = []
+            if text:
+                segments.append({"type": "text", "content": text})
+            for b64 in image_b64s:
+                segments.append({"type": "image", "content": b64})
+            try:
+                await self.ctx.send.hybrid(segments, stream_id)
+                return
+            except Exception as exc:
+                self.ctx.logger.warning(
+                    "%s 合并消息发送失败，降级为逐条发送: %s", where, exc
+                )
+        elif threshold >= 0 and len(image_b64s) > threshold:
+            self.ctx.logger.warning(
+                "%s 图片压缩后仍超过合并安全线（%d 张图），逐条发送",
+                where,
+                len(image_b64s),
+            )
+        # 逐条发送（未达合并阈值、体积超限，或合并降级到底）
+        if text:
+            await self.ctx.send.text(text, stream_id)
+        for b64 in image_b64s:
+            try:
+                await self.ctx.send.image(b64, stream_id)
+                await asyncio.sleep(0.5)
+            except Exception as exc:
+                self.ctx.logger.error("%s 发送图片失败: %s", where, exc)
+
     def _render_push_text(self, parsed: dict[str, Any], name: str) -> str:
         """按模板渲染推送文本。
 
@@ -473,15 +646,17 @@ class BiliPushPlugin(MaiBotPlugin):
                 self.ctx.logger.warning("图片下载失败 %s: %s", img_url, exc)
 
         for gid in groups:
-            ok = await self._send_group_text(gid, text)
-            if ok and image_b64s:
-                for b64 in image_b64s:
-                    try:
-                        stream_id = await self._get_stream_id(gid)
-                        await self.ctx.send.image(b64, stream_id)
-                        await asyncio.sleep(0.5)
-                    except Exception as exc:
-                        self.ctx.logger.error("群 %s 发送图片失败: %s", gid, exc)
+            stream_id = await self._get_stream_id(gid)
+            if not stream_id:
+                self.ctx.logger.error("群 %s 无法获取 stream_id", gid)
+                continue
+            try:
+                await self._send_dynamic_content(
+                    stream_id, text, image_b64s,
+                    where=f"群 {gid}", sender_name=name,
+                )
+            except Exception as exc:
+                self.ctx.logger.error("群 %s 发送文本失败: %s", gid, exc, exc_info=True)
             await asyncio.sleep(1.0)
 
         self.ctx.logger.info(
@@ -669,20 +844,17 @@ class BiliPushPlugin(MaiBotPlugin):
                 parsed = parse_dynamic(target)
                 if parsed:
                     text = self._render_push_text(parsed, parsed["author"])
-                    r = await self._reply(stream_id, text)
                     image_b64s: list[str] = []
                     for img_url in parsed["images"][: self.config.settings.max_images]:
                         try:
                             image_b64s.append(await self._download_image_b64(img_url))
                         except Exception as exc:
                             self.ctx.logger.warning("图片下载失败 %s: %s", img_url, exc)
-                    for b64 in image_b64s:
-                        try:
-                            await self.ctx.send.image(b64, stream_id)
-                            await asyncio.sleep(0.5)
-                        except Exception as exc:
-                            self.ctx.logger.error("私聊发送图片失败: %s", exc)
-                    return r
+                    await self._send_dynamic_content(
+                        stream_id, text, image_b64s,
+                        where="私聊", sender_name=parsed["author"],
+                    )
+                    return True, text, 2
             return await self._reply(stream_id, "无法确定推送目标。")
 
         # ---- help ----
