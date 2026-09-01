@@ -527,6 +527,9 @@ def parse_dynamic(item: dict[str, Any]) -> Optional[dict[str, Any]]:
             "url": f"https://t.bilibili.com/{id_str}",
             "top": is_top_dynamic(item),
             "forward": is_forward_dynamic(item),
+            # 被转发动态的地址（非转发动态为空）。转发视频投稿时用它给出原视频入口，
+            # 而不是转发动态本身——转发动态点进去还要再跳一次。
+            "orig_url": "",
         }
         if desc_text:
             result["text"] += desc_text
@@ -541,6 +544,9 @@ def parse_dynamic(item: dict[str, Any]) -> Optional[dict[str, Any]]:
             else:
                 om = orig.get("modules") or {}
                 oauthor = (om.get("module_author") or {}).get("name") or "未知用户"
+                orig_id = str(orig.get("id_str") or "")
+                if orig_id:
+                    result["orig_url"] = f"https://t.bilibili.com/{orig_id}"
                 omd = om.get("module_dynamic") or {}
                 odesc = (omd.get("desc") or {}).get("text") or ""
                 otext, oimgs, ovideo = _extract_major(omd)

@@ -235,7 +235,9 @@ async def main():
     assert pv and pv["video"] and pv["video"]["bvid"] == "BV1xx411c7mD", pv
     video_text = plug._render_push_text(pv, "测试UP")
     assert "新视频标题" in video_text, video_text
-    assert "🔗 https://t.bilibili.com/789" in video_text, f"视频推送应附链接: {video_text!r}"
+    assert "🔗 https://www.bilibili.com/video/BV1xx411c7mD" in video_text, (
+        f"视频推送应附视频直链: {video_text!r}"
+    )
 
     # 模板显式含 {url} 时：视频链接不得重复附加；图文也带上链接
     plug.config.settings.push_text_template = (
@@ -249,6 +251,85 @@ async def main():
         "📢 {name} 发布了新动态\n{text}"
     )
     print("  -> 图文只推文字图片、视频附链接、模板含 {url} 时不重复")
+
+    print("== 转发视频动态：附原视频直链（而非转发动态链接）==")
+    # 真机场景（共鸣电台转发 @惡魔棄 的视频投稿《凭什么你 为什么我》）：
+    # 转发动态自己的链接点进去还要再跳一次才到视频，
+    # 原动态是视频时应直接给 bilibili.com/video/<bvid>
+    fwd_video_item = {
+        "id_str": "1243134745747914757",
+        "type": "DYNAMIC_TYPE_FORWARD",
+        "modules": {
+            "module_author": {"name": "共鸣电台_FMInfinity", "pub_ts": 1788200000},
+            "module_dynamic": {"desc": {"text": "晚安咯～"}},
+        },
+        "orig": {
+            "id_str": "1243134700000000001",
+            "type": "DYNAMIC_TYPE_AV",
+            "modules": {
+                "module_author": {"name": "惡魔棄"},
+                "module_dynamic": {
+                    "desc": {"text": ""},
+                    "major": {
+                        "type": "MAJOR_TYPE_ARCHIVE",
+                        "archive": {
+                            "title": "凭什么你 为什么我 // 海伊",
+                            "cover": "http://img/cover2.jpg",
+                            "bvid": "BV1yy522d8nE",
+                        },
+                    },
+                },
+            },
+        },
+    }
+    pf = parse_dynamic(fwd_video_item)
+    assert pf and pf["forward"] and pf["video"], pf
+    assert pf["video"]["bvid"] == "BV1yy522d8nE", pf["video"]
+    assert pf["orig_url"] == "https://t.bilibili.com/1243134700000000001", pf["orig_url"]
+    # 图片 = 转发者附图(无) + 原动态视频封面
+    assert pf["images"] == ["http://img/cover2.jpg"], pf["images"]
+    fwd_text = plug._render_push_text(pf, "共鸣电台_FMInfinity")
+    assert "🔗 https://www.bilibili.com/video/BV1yy522d8nE" in fwd_text, (
+        f"转发视频应附原视频直链: {fwd_text!r}"
+    )
+    assert "t.bilibili.com/1243134745747914757" not in fwd_text, (
+        f"不应再附转发动态自身链接: {fwd_text!r}"
+    )
+    assert "🔁 转发 @惡魔棄" in fwd_text, fwd_text
+
+    # 转发视频但拿不到 bvid -> 退回原动态链接
+    no_bvid = dict(fwd_video_item)
+    no_bvid["orig"] = {
+        "id_str": "1243134700000000002",
+        "modules": {
+            "module_author": {"name": "惡魔棄"},
+            "module_dynamic": {"major": {
+                "type": "MAJOR_TYPE_ARCHIVE",
+                "archive": {"title": "无bvid视频", "cover": "http://img/c.jpg", "bvid": ""},
+            }},
+        },
+    }
+    pnb = parse_dynamic(no_bvid)
+    fallback_text = plug._render_push_text(pnb, "共鸣电台_FMInfinity")
+    assert "🔗 https://t.bilibili.com/1243134700000000002" in fallback_text, (
+        f"无 bvid 应退回原动态链接: {fallback_text!r}"
+    )
+
+    # 非转发的视频投稿：同样给视频直链（自己发的视频也点开即播）
+    self_video_text = plug._render_push_text(pv, "测试UP")
+    assert "🔗 https://www.bilibili.com/video/BV1xx411c7mD" in self_video_text, (
+        f"自己发的视频也应附视频直链: {self_video_text!r}"
+    )
+    assert "t.bilibili.com/789" not in self_video_text, (
+        f"不应再附动态链接: {self_video_text!r}"
+    )
+
+    # 模板含 {url} 时：转发视频不再额外附加（{url} 是本条动态链接）
+    plug.config.settings.push_text_template = "📢 {name} 发布了新动态\n{text}\n\n🔗 {url}"
+    fwd_text2 = plug._render_push_text(pf, "共鸣电台_FMInfinity")
+    assert fwd_text2.count("https://") == 1, f"模板含 {{url}} 时不应重复附加: {fwd_text2!r}"
+    plug.config.settings.push_text_template = "📢 {name} 发布了新动态\n{text}"
+    print("  -> 转发视频给原视频直链、无 bvid 退原动态、模板含 {url} 不重复")
 
     print("== OPUS 图文动态：标题+正文完整解析 ==")
     # 真机实测踩坑（共鸣电台 1242522747324596258，miku 生日动态）：

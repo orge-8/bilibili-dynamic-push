@@ -599,7 +599,11 @@ class BiliPushPlugin(MaiBotPlugin):
 
         默认模板不带动态链接（图文/转发直接推文字+图片）。
         视频投稿例外：QQ 里没法直接播视频，只有封面图，
-        自动在末尾附上链接（模板里已写 {url} 时不重复加）。
+        自动在末尾附上**视频直链**（bilibili.com/video/<bvid>，点开即播）：
+        - 自己发的视频 → 该视频的直链
+        - 转发的视频 → **原视频**的直链（不是转发动态本身）
+        - 拿不到 bvid 时：转发退回原动态链接，否则退回本条动态链接
+        （模板里已写 {url} 时不重复加）。
         无文字但带图片的动态（纯配图）不显示"（无文字内容）"占位——
         图片本身就是内容，占位符只会徒增噪音。
         """
@@ -621,8 +625,24 @@ class BiliPushPlugin(MaiBotPlugin):
             time=time_str,
         )
         if parsed["video"] and "{url}" not in cfg.push_text_template:
-            text += f"\n🔗 {parsed['url']}"
+            text += f"\n🔗 {self._video_entry_url(parsed)}"
         return text
+
+    @staticmethod
+    def _video_entry_url(parsed: dict[str, Any]) -> str:
+        """视频动态该给哪个入口链接。
+
+        一律给视频直链（bilibili.com/video/<bvid>）——点开即播。
+        动态链接在 QQ 里点进去还要再跳一次才到视频，没必要。
+        转发场景的 bvid 来自原动态，所以自动就是"原视频"直链。
+        拿不到 bvid（极端情况）才退回动态链接：转发优先用原动态地址。
+        """
+        bvid = str((parsed["video"] or {}).get("bvid") or "")
+        if bvid:
+            return f"https://www.bilibili.com/video/{bvid}"
+        if parsed.get("forward"):
+            return parsed.get("orig_url") or parsed["url"]
+        return parsed["url"]
 
     async def _push_dynamic(self, uid: str, item: dict[str, Any], groups: list[int]) -> None:
         assert self._subs is not None
