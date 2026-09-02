@@ -206,6 +206,21 @@ async def main():
     }
     # 开奖正则需同时匹配"恭喜@xx中奖"与"详情请点击…查看"
     assert parse_dynamic(lottery) is None
+    # ignore_lottery=False 时保留开奖动态（v1.4.2：配置项真正生效）
+    assert parse_dynamic(lottery, ignore_lottery=False) is not None
+
+    # 插件层必须把 ignore_lottery 配置传进 parse_dynamic
+    plug.config.settings.ignore_lottery = False
+    SENT.clear()
+    await plug._push_dynamic("114514", lottery, [12345])
+    kinds = [s[0] for s in SENT]
+    assert kinds == ["text"], f"ignore_lottery=False 时开奖动态应正常推送: {SENT}"
+    plug.config.settings.ignore_lottery = True
+    SENT.clear()
+    await plug._push_dynamic("114514", lottery, [12345])
+    assert SENT == [], f"ignore_lottery=True（默认）时开奖动态应被过滤: {SENT}"
+    # 开奖测试推送时用了默认名"UP主"，会经 set_name 污染订阅缓存，恢复它
+    await plug._subs.set_name("114514", "测试UP")
 
     print("== 推送格式：图文不带链接，视频自动附链接 ==")
     # 用户需求：不要动态链接，要动态里的图片和文字本身
@@ -251,6 +266,28 @@ async def main():
         "📢 {name} 发布了新动态\n{text}"
     )
     print("  -> 图文只推文字图片、视频附链接、模板含 {url} 时不重复")
+
+    print("== 坏模板兜底：format 异常时退回默认模板，动态仍可推送 ==")
+    # v1.4.2：用户模板含未配对 { 时不应让该动态永远推不出
+    plug.config.settings.push_text_template = "坏模板 {name"  # 未配对 { -> ValueError
+    orig_dl0 = plug._download_image_b64
+
+    async def stub_dl0(url: str) -> str:
+        return "ZmFrZWJhc2U2NA=="
+
+    plug._download_image_b64 = stub_dl0  # type: ignore[assignment]
+    SENT.clear()
+    await plug._push_dynamic("114514", fake_item, [12345])
+    plug._download_image_b64 = orig_dl0
+    kinds = [s[0] for s in SENT]
+    assert kinds == ["hybrid"], f"坏模板应退回默认模板正常推送: {SENT}"
+    # SENT 里 hybrid 只记段类型，正文正确性直接验证渲染函数：
+    # 坏模板下 _render_push_text 必须不抛异常且含正文与 UP 主名
+    plug.config.settings.push_text_template = "坏模板 {name"
+    fallback = plug._render_push_text(p, "测试UP")
+    assert "新歌发布啦" in fallback and "测试UP" in fallback, f"退回模板后正文丢失: {fallback!r}"
+    plug.config.settings.push_text_template = "📢 {name} 发布了新动态\n{text}"
+    print(f"  -> 坏模板退回默认渲染且推送成功: {kinds}")
 
     print("== 转发视频动态：附原视频直链（而非转发动态链接）==")
     # 真机场景（共鸣电台转发 @惡魔棄 的视频投稿《凭什么你 为什么我》）：
@@ -783,6 +820,75 @@ async def main():
     )
     print("  -> 压缩不可用时退逐条（Pillow 缺失兼容路径）")
     del real_bytes_total
+
+    print("== 图片下载域名白名单（v1.4.2 SSRF 防线）==")
+    # 白名单内：hdslb.com / bilibili.com 子域放行（网络层 stub 验证调用路径）
+    # 白名单外：直接 ValueError，不发请求
+    from bili_client import BiliClient as _BC
+
+    bc4 = _BC()
+    try:
+        await bc4.download_bytes("http://evil.example.com/payload.jpg")
+        raise AssertionError("白名单外域名应被拒绝")
+    except ValueError as exc:
+        assert "拒绝下载" in str(exc), exc
+    await bc4.close()
+
+    # 白名单内走网络层 stub（不真下载），验证请求确实发出
+    bc5 = _BC()
+    called = {}
+
+    async def stub_get(url, **kw):
+        called["url"] = url
+
+        class _R:
+            content = b"imgbytes"
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+        return _R()
+
+    c5 = await bc5._ensure_client()
+    c5.get = stub_get  # type: ignore[method-assign]
+    raw = await bc5.download_bytes("https://i0.hdslb.com/bfs/article/x.jpg")
+    assert raw == b"imgbytes" and called["url"].endswith("x.jpg")
+    await bc5.close()
+    print("  -> 白名单外拒绝（ValueError），白名单内正常下载")
+
+    print("== push_history 置顶不变不写盘（v1.4.2 冗余写盘修复）==")
+    # 同一置顶反复轮询不应触发 set_last（磁盘写入）
+    top_same = {
+        "id_str": "100",
+        "type": "DYNAMIC_TYPE_DRAW",
+        "modules": {
+            "module_tag": {"text": "置顶"},
+            "module_author": {"name": "测试UP", "pub_ts": 1700000000},
+            "module_dynamic": {
+                "desc": {"text": "置顶内容"},
+                "major": {"type": "MAJOR_TYPE_DRAW", "draw": {"items": []}},
+            },
+        },
+    }
+    set_calls = []
+    orig_set_last = plug._hist.set_last
+
+    async def spy_set_last(uid, dyn_id, top_id=""):
+        set_calls.append((uid, dyn_id, top_id))
+        return await orig_set_last(uid, dyn_id, top_id)
+
+    plug._hist.set_last = spy_set_last  # type: ignore[method-assign]
+    # 首次见到该 UID：初始化会写一次（记基准）
+    await plug._check_uid("777001")
+    n_init = len(set_calls)
+    assert n_init >= 1
+    # 第二轮：置顶没变、没有新普通动态 -> 不应再写
+    set_calls.clear()
+    await plug._check_uid("777001")
+    assert set_calls == [], f"置顶未变不应写盘: {set_calls}"
+    plug._hist.set_last = orig_set_last  # type: ignore[method-assign]
+    print(f"  -> 初始化写 {n_init} 次，第二轮置顶不变 0 次写入")
 
     print("== 请求头自洽性（UA/version 不一致会被 WAF 判为脚本）==")
     import re as _re

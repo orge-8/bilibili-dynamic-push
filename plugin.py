@@ -57,6 +57,8 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用自动推送监控")
+    # SDK config.extract_plugin_config_version 强制要求此字段（缺失会抛
+    # PluginConfigVersionError 拒绝加载），并非死代码——v1.4.2 审查时曾误删后回滚
     config_version: str = Field(default="1.0.0", description="配置版本")
 
 
@@ -114,7 +116,7 @@ class SettingsSection(PluginConfigBase):
     )
     ignore_lottery: bool = Field(
         default=True,
-        description="是否丢弃开奖类动态。",
+        description="是否丢弃开奖类动态。（v1.4.2 起真正生效；此前版本该配置无效，开奖动态始终被过滤）",
     )
     push_text_template: str = Field(
         default=_PUSH_TEMPLATE_NEW,
@@ -388,11 +390,14 @@ class BiliPushPlugin(MaiBotPlugin):
                 new_items.append(top_item)
                 self.ctx.logger.info("UID %s 检测到新置顶动态 %s", uid, top_id_str)
 
-        # 更新置顶记录
+        # 更新置顶记录（仅在置顶 ID 变化时写盘——此前每轮轮询都无条件
+        # set_last，导致每个带置顶的订阅每 3 分钟写一次 push_history.json）
         if top_item:
-            await self._hist.set_last(
-                uid, str(hist.get("dyn_id") or last_id), str(top_item.get("id_str") or "")
-            )
+            top_id_str = str(top_item.get("id_str") or "")
+            if top_id_str != last_top:
+                await self._hist.set_last(
+                    uid, str(hist.get("dyn_id") or last_id), top_id_str
+                )
 
         if not new_items:
             return
@@ -445,23 +450,13 @@ class BiliPushPlugin(MaiBotPlugin):
             self._group_stream_cache[key] = stream_id
         return stream_id
 
-    async def _send_group_text(self, group_id: int, text: str) -> bool:
-        try:
-            stream_id = await self._get_stream_id(group_id)
-            if not stream_id:
-                self.ctx.logger.error("群 %s 无法获取 stream_id", group_id)
-                return False
-            return bool(await self.ctx.send.text(text, stream_id))
-        except Exception as exc:
-            self.ctx.logger.error("群 %s 发送文本失败: %s", group_id, exc, exc_info=True)
-            return False
-
     async def _download_image_b64(self, url: str) -> str:
         assert self._client is not None
-        client = await self._client._ensure_client()
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return base64.b64encode(resp.content).decode("ascii")
+        try:
+            raw = await self._client.download_bytes(url)
+        except Exception as exc:
+            raise RuntimeError(f"图片下载失败: {exc}") from exc
+        return base64.b64encode(raw).decode("ascii")
 
     # 合并前的图片压缩参数：B 站动态图多为长图/高清图（单张 base64 可达 4MB），
     # 9 张必超 RPC 帧 16MB 上限。QQ 聊天窗口显示宽度有限，压到 1080px 长边
@@ -648,12 +643,27 @@ class BiliPushPlugin(MaiBotPlugin):
             body = ""
         else:
             body = "（无文字内容）"
-        text = cfg.push_text_template.format(
-            name=f"{name}{tag}",
-            text=body,
-            url=parsed["url"],
-            time=time_str,
-        )
+        try:
+            text = cfg.push_text_template.format(
+                name=f"{name}{tag}",
+                text=body,
+                url=parsed["url"],
+                time=time_str,
+            )
+        except (KeyError, ValueError, IndexError) as exc:
+            # 模板含未配对 { / 不存在的变量名时不让该动态永远推不出：
+            # 记日志后退回默认模板渲染（动态内容本身不受影响）
+            self.ctx.logger.warning(
+                "推送模板渲染失败（%s: %s），本条动态退回默认模板。"
+                "请检查 push_text_template 中的大括号与变量名",
+                type(exc).__name__, exc,
+            )
+            text = _PUSH_TEMPLATE_NEW.format(
+                name=f"{name}{tag}",
+                text=body,
+                url=parsed["url"],
+                time=time_str,
+            )
         if parsed["video"] and "{url}" not in cfg.push_text_template:
             text += f"\n🔗 {self._video_entry_url(parsed)}"
         return text
@@ -676,7 +686,9 @@ class BiliPushPlugin(MaiBotPlugin):
 
     async def _push_dynamic(self, uid: str, item: dict[str, Any], groups: list[int]) -> None:
         assert self._subs is not None
-        parsed = parse_dynamic(item)
+        parsed = parse_dynamic(
+            item, ignore_lottery=self.config.settings.ignore_lottery
+        )
         if parsed is None:
             self.ctx.logger.info("UID %s 动态 %s 解析为空或被过滤", uid, item.get("id_str"))
             return

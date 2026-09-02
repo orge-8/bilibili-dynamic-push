@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.bilibili-dynamic-push",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "name": "B站动态自动推送",
-  "description": "定时轮询订阅的 B 站 UP 主动态，发现新动态（图文/视频/转发）自动推送到群聊：图文直推文字+图片（OPUS 图文完整解析标题与正文；带图动态合并为一条消息——1~2 张发图文混合消息、3 张起发 QQ 转发卡片，大图自动压缩进帧安全线，失败自动降级逐条），视频投稿附视频直链（转发的给原视频直链）。支持 /dyn add/remove/list 等命令订阅管理（/动态、/订阅 同义）、buvid 指纹激活（ExClimbWuzhi）、置顶识别、旧动态过期过滤、轮询抖动与风控熔断。",
+  "description": "定时轮询订阅的 B 站 UP 主动态，发现新动态（图文/视频/转发）自动推送到群聊：图文直推文字+图片（OPUS 图文完整解析标题与正文；带图动态合并为一条消息——1~2 张发图文混合消息、3 张起发 QQ 转发卡片，大图自动压缩进帧安全线，失败自动降级逐条），视频投稿附视频直链（转发的给原视频直链）。支持 /dyn add/remove/list 等命令订阅管理（/动态、/订阅 同义）、buvid 指纹激活（ExClimbWuzhi）、置顶识别、开奖动态过滤开关（ignore_lottery）、坏模板自动回退、图片 CDN 域名白名单、旧动态过期过滤、轮询抖动与风控熔断。",
   "author": {
     "name": "orge-8",
     "url": "https://github.com/orge-8"

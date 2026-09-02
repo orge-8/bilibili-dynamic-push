@@ -60,6 +60,13 @@ WAF_STATUS = (403, 412, 429, 503)
 # 这些不该重试，但**应该触发退避**——拉长下次轮询间隔才有机会恢复。
 RISK_CODES = (-412, -352)
 
+# 图片下载域名白名单：动态图片只可能来自 B 站自家 CDN（hdslb.com），
+# 收紧白名单防止把非 B 站 URL 拿来下载（SSRF 面）。
+IMAGE_HOST_SUFFIXES = (
+    ".hdslb.com",
+    ".bilibili.com",
+)
+
 # 重试退避（秒）。被风控时立刻重试只会让计数器雪上加霜。
 _RETRY_BACKOFF = (3.0, 8.0)
 
@@ -180,6 +187,20 @@ class BiliClient:
             self._seed_cookies(client)
             self._client = client
         return self._client
+
+    async def download_bytes(self, url: str) -> bytes:
+        """下载图片二进制（限 B 站 CDN 域名白名单，供推送图片用）。
+
+        白名单外域名直接抛 ValueError（如 i0.hdslb.com、boss.hdslb.com
+        均以 hdslb.com 结尾，正常动态配图全部命中白名单）。
+        """
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        if not any(host == s.lstrip(".") or host.endswith(s) for s in IMAGE_HOST_SUFFIXES):
+            raise ValueError(f"非 B 站 CDN 域名，拒绝下载: {host or url}")
+        client = await self._ensure_client()
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
 
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
@@ -494,8 +515,11 @@ def _extract_major(module_dynamic: dict[str, Any]) -> tuple[str, list[str], Opti
     return text, images, video
 
 
-def parse_dynamic(item: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """把一条原始动态解析成推送所需结构；开奖动态返回 None。"""
+def parse_dynamic(item: dict[str, Any], ignore_lottery: bool = True) -> Optional[dict[str, Any]]:
+    """把一条原始动态解析成推送所需结构；开奖动态返回 None。
+
+    ignore_lottery=False 时不做开奖过滤（对应插件配置 ignore_lottery）。
+    """
     try:
         id_str = str(item.get("id_str") or item.get("id") or "")
         if not id_str:
@@ -507,8 +531,8 @@ def parse_dynamic(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         major_text, images, video = _extract_major(module_dynamic)
         desc_text = (module_dynamic.get("desc") or {}).get("text") or ""
 
-        # 开奖过滤
-        if LOTTERY_RE.search(f"{desc_text}\n{major_text}"):
+        # 开奖过滤（ignore_lottery=False 时保留开奖动态）
+        if ignore_lottery and LOTTERY_RE.search(f"{desc_text}\n{major_text}"):
             return None
 
         pub_ts = 0
