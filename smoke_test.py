@@ -435,6 +435,19 @@ async def main():
     plug.config.settings.push_text_template = "📢 {name} 发布了新动态\n{text}"
     print("  -> 旧默认迁移、自定义保留")
 
+    print("== 合并阈值自动迁移（2 -> 0，有图片就合并）==")
+    # 与模板同理：老部署 config.toml 里写死 hybrid_merge_threshold = 2，
+    # 代码升级改不了已存配置，不迁移则新行为永远到不了真机
+    plug.config.settings.hybrid_merge_threshold = 2
+    plug._migrate_merge_threshold()
+    assert plug.config.settings.hybrid_merge_threshold == 0, "旧默认阈值应迁移为 0"
+    # 非旧默认值的自定义阈值必须原样保留
+    plug.config.settings.hybrid_merge_threshold = 999
+    plug._migrate_merge_threshold()
+    assert plug.config.settings.hybrid_merge_threshold == 999, "自定义阈值被误改！"
+    plug.config.settings.hybrid_merge_threshold = 0
+    print("  -> 旧默认 2 迁移为 0，自定义 999 保留")
+
     print("== 私聊 /dyn test 也推送图片 ==")
     # 真机实测：私聊 test 原先只回文本，用户永远看不到图片效果
     SENT.clear()
@@ -469,14 +482,15 @@ async def main():
     )
     plug._client.fetch_dynamics = orig_fetch
     plug._download_image_b64 = orig_dl
-    # 私聊 test 只有 1 张图：不超阈值（默认 2），走逐条 text+image
+    # 私聊 test 只有 1 张图：v1.4.0 起"有图片就合并"（默认阈值 0）
+    # 且 ≤2 张走单条混合消息（text+image 两段一条发完）
     kinds = [s[0] for s in SENT]
-    assert "text" in kinds and "image" in kinds, f"私聊测试应发文本+图片: {SENT}"
+    assert kinds == ["hybrid"], f"单图应合并为一条混合消息: {SENT}"
     assert "私聊测试动态" in r[1], r[1]
-    print(f"  -> 私聊 test 发送了 {kinds}")
+    print(f"  -> 私聊 test 单图合并为一条混合消息: {kinds}")
 
-    print("== 多图合并：>2 张走 send.forward 转发卡片，<=2 张保持逐条 ==")
-    # 用户需求：多图逐张发会刷屏，超过 2 张时合并为 QQ 合并转发卡片
+    print("== 有图片就合并：1 条 forward 转发卡片（v1.4.0 默认阈值 0）==")
+    # 用户需求：只要有图片，文字+图片就合并成一条消息（不再按张数区分）
     merge_item = {
         "id_str": "888",
         "type": "DYNAMIC_TYPE_DRAW",
@@ -497,7 +511,7 @@ async def main():
     orig_dl2 = plug._download_image_b64
     plug._download_image_b64 = stub_dl  # type: ignore[assignment]
 
-    # ① 默认阈值 2：9 张图（max_images 默认 9 不截断）
+    # ① 默认阈值 0：9 张图（max_images 默认 9 不截断）
     #    -> 1 条 forward 转发卡片（1 文本节点 + 9 图片节点），节点昵称 = UP 主名
     SENT.clear()
     await plug._push_dynamic("114514", merge_item, [12345])
@@ -508,7 +522,7 @@ async def main():
         "测试UP:image,测试UP:image,测试UP:image,测试UP:image,测试UP:image,测试UP:image>"
     ), f"forward 应为文字+9图共10节点，昵称=UP主名: {SENT[0][1]}"
 
-    # ② 2 张图（不超阈值）-> 文字一条 + 图片逐张
+    # ② 默认阈值 0 下，2 张图合并为一条混合消息（≤2 张走 hybrid 直出，不进卡片）
     two_img = dict(merge_item)
     two_img["modules"] = {
         "module_author": merge_item["modules"]["module_author"],
@@ -523,7 +537,19 @@ async def main():
     SENT.clear()
     await plug._push_dynamic("114514", two_img, [12345])
     kinds = [s[0] for s in SENT]
-    assert kinds == ["text", "image", "image"], f"2 图应保持逐条: {SENT}"
+    assert kinds == ["hybrid"], f"2 图应合并为一条混合消息: {SENT}"
+    assert SENT[0][1] == "<3 segs: text,image,image>", (
+        f"2 图 hybrid 应为文字+2图共3段: {SENT[0][1]}"
+    )
+
+    # ②-b 显式把阈值设回 2（旧行为）-> 2 张图不合并，保持逐条
+    plug.config.settings.hybrid_merge_threshold = 2
+    SENT.clear()
+    await plug._push_dynamic("114514", two_img, [12345])
+    assert [s[0] for s in SENT] == ["text", "image", "image"], (
+        f"阈值 2 下 2 图不应合并: {SENT}"
+    )
+    plug.config.settings.hybrid_merge_threshold = 0
 
     # ③ 纯图无文字（>2 张，max_images=9 不截断）-> 单条 forward（text+9 image 节点）
     no_text_9 = dict(merge_item)
@@ -545,20 +571,27 @@ async def main():
         f"纯图 9 张应合并为单条 forward: {SENT}"
     )
 
-    # ④ 阈值改 999（从不合并）-> 恢复逐条；阈值 0（总是合并）-> 1 张也合并
+    # ④ 阈值 999（从不合并）-> 逐条；阈值 0（默认，有图就合并）-> 任意张数都合并
     plug.config.settings.hybrid_merge_threshold = 999
     SENT.clear()
     await plug._push_dynamic("114514", two_img, [12345])
     assert [s[0] for s in SENT] == ["text", "image", "image"], f"阈值 999 不应合并: {SENT}"
 
+    # 无图片的动态：任何阈值下都只发一条纯文本（没有可合并的内容）
     plug.config.settings.hybrid_merge_threshold = 0
-    one_img = dict(two_img)
+    no_img = dict(merge_item)
+    no_img["modules"] = {
+        "module_author": merge_item["modules"]["module_author"],
+        "module_dynamic": {
+            "desc": {"text": "纯文字动态"},
+            "major": None,
+        },
+    }
     SENT.clear()
-    await plug._push_dynamic("114514", one_img, [12345])
-    assert [s[0] for s in SENT] == ["forward"], f"阈值 0 应始终合并: {SENT}"
+    await plug._push_dynamic("114514", no_img, [12345])
+    assert [s[0] for s in SENT] == ["text"], f"纯文字动态应只发一条文本: {SENT}"
 
     # ⑤ forward 失败自动降级为 hybrid（协议端不支持转发卡片时）
-    plug.config.settings.hybrid_merge_threshold = 2
     orig_forward = plug.ctx.send.forward
 
     async def broken_forward(messages, stream_id, **kw):
@@ -587,11 +620,19 @@ async def main():
         assert kinds and kinds[0] == "text" and kinds.count("image") == 9, (
             f"forward+hybrid 均失败应降级为 text+9 图(max_images=9): {SENT}"
         )
+
+        # ⑦ 1~2 张图（hybrid 直出）失败 -> 逐条（不会尝试 forward 卡片）
+        SENT.clear()
+        await plug._push_dynamic("114514", two_img, [12345])
+        kinds = [s[0] for s in SENT]
+        assert kinds == ["text", "image", "image"], (
+            f"2 图 hybrid 失败应降级为逐条: {SENT}"
+        )
     finally:
         plug.ctx.send.forward = orig_forward  # type: ignore[method-assign]
         plug.ctx.send.hybrid = orig_hybrid  # type: ignore[method-assign]
     plug._download_image_b64 = orig_dl2
-    print("  -> >2 张 forward 卡片、失败降级 hybrid、再降级逐条、阈值可调")
+    print("  -> ≤2张 hybrid、>2张 forward 卡片、失败降级链与阈值可调")
 
     print("== 帧体积防线：合并 payload 超过 RPC 帧上限不尝试合并，直接逐条 ==")
     # 真机实测：9 张大图 base64 合计约 36MB，超过 msgpack 帧上限 16MB，

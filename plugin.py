@@ -42,6 +42,12 @@ _MAX_BACKOFF = 1800.0
 _PUSH_TEMPLATE_OLD = "📢 {name} 发布了新动态\n{text}\n\n🔗 {url}"
 _PUSH_TEMPLATE_NEW = "📢 {name} 发布了新动态\n{text}"
 
+# 合并阈值新旧默认值。v1.4.0 起"有图片就合并"（0），旧默认是"超过 2 张才合并"（2）。
+# 与模板同理：旧部署的 config.toml 会把 2 写死，代码升级改不了已存配置，
+# 必须识别旧默认值并迁移，否则新行为永远到不了老机器。
+_MERGE_THRESHOLD_OLD = 2
+_MERGE_THRESHOLD_NEW = 0
+
 
 class PluginSection(PluginConfigBase):
     """插件基础配置。"""
@@ -91,12 +97,11 @@ class SettingsSection(PluginConfigBase):
         description="单条动态最多推送的图片数量（B 站上限 9）。v1.2.0 起多图合并为一条消息推送，无刷屏顾虑，默认放开到上限。",
     )
     hybrid_merge_threshold: int = Field(
-        default=2,
+        default=_MERGE_THRESHOLD_NEW,
         description=(
-            "图片合并阈值：动态图片数超过该值时，文字+图片合并为一条"
-            "合并转发卡片发送（优先 send.forward，协议端不支持时自动降级"
-            "混合消息，再降级逐条发送）；不超过时保持文字一条、图片逐张发送。"
-            "设为 0 表示始终合并；设为 999 表示从不合并。"
+            "图片合并阈值：动态图片数超过该值时合并为一条消息"
+            "（默认 0 = 有图片就合并；999 = 从不合并）。合并形式按张数分流："
+            "1~2 张发单条图文混合消息，3 张及以上发合并转发卡片。"
         ),
     )
     max_dynamic_age: int = Field(
@@ -167,9 +172,13 @@ class BiliPushPlugin(MaiBotPlugin):
     config_model = BiliPushConfig
 
     # RPC 帧大小上限（msgpack 序列化，真机报错实测 16777216 = 16MB）。
-    # 合并消息的 segments（含全部图片 base64）必须小于该值才能走 send.hybrid；
-    # 安全线取 11MB 留足元数据与协议开销余量。超限直接逐条发送，不浪费尝试。
+    # 合并消息的 segments（含全部图片 base64）必须小于该值才能走合并；
+    # 安全线取 11MB 留足元数据与协议开销余量。超限先压缩，压不进再逐条。
     HYBRID_FRAME_SAFE_BYTES = 11 * 1024 * 1024
+
+    # 合并形式分流的张数界线：≤2 张走单条图文混合（直出，观感轻），
+    # >2 张走合并转发卡片（多节点卡片，观感整）。用户 v1.4.1 指定。
+    FORWARD_CARD_MIN_IMAGES = 2
 
     def __init__(self):
         super().__init__()
@@ -200,9 +209,27 @@ class BiliPushPlugin(MaiBotPlugin):
                 "如需恢复链接，可在配置 push_text_template 中加回 {url}"
             )
 
+    def _migrate_merge_threshold(self) -> None:
+        """旧默认阈值 2（超过 2 张才合并）自动迁移为 0（有图片就合并）。
+
+        与模板同理：只动"未改过的旧默认值"。用户若主动设过 2 想保留旧行为，
+        迁移后手动改回即可（日志会说明）。
+        """
+        cur = self.config.settings.hybrid_merge_threshold
+        if cur == _MERGE_THRESHOLD_OLD:
+            self.config.settings.hybrid_merge_threshold = _MERGE_THRESHOLD_NEW
+            self.ctx.logger.info(
+                "合并阈值已自动从 %d 迁移为 %d：有图片就合并为一条消息；"
+                "若想恢复「超过 2 张才合并」的旧行为，"
+                "把 hybrid_merge_threshold 改回 2",
+                _MERGE_THRESHOLD_OLD,
+                _MERGE_THRESHOLD_NEW,
+            )
+
     async def on_load(self) -> None:
         cfg = self.config
         self._migrate_push_template()
+        self._migrate_merge_threshold()
         data_dir = str(self.ctx.paths.data_dir)
         self._subs = SubscriptionStore(data_dir)
         self._hist = PushHistory(data_dir)
@@ -228,6 +255,7 @@ class BiliPushPlugin(MaiBotPlugin):
         del scope, config_data, version
         cfg = self.config
         self._migrate_push_template()
+        self._migrate_merge_threshold()
         if self._subs is not None:
             self._subs.sync_from_config(cfg.subscriptions.users)
             await self._subs.save()
@@ -515,16 +543,16 @@ class BiliPushPlugin(MaiBotPlugin):
     ) -> None:
         """把一条动态的文字+图片发到指定消息流。
 
-        图片数超过 hybrid_merge_threshold 时，合并为一条消息发送，降级链：
-        1. send.forward —— QQ 合并转发卡片（"群聊的聊天记录"样式），
-           文字一条节点 + 每张图一条节点，观感最接近手动合并转发。
-        2. send.hybrid —— 单条图文混合消息（协议端不支持转发卡片时）。
-        3. 逐条发送 —— 文字一条，图片逐张（间隔 0.5s）。
+        有图片（数量超过 hybrid_merge_threshold，默认 0 = 有图就合并）时
+        合并为一条消息，按张数选择形式：
+        - 1~2 张 → send.hybrid 单条图文混合消息（文字+图片混排，直出）；
+        - 3 张以上 → send.forward QQ 合并转发卡片（"群聊的聊天记录"样式），
+          文字一条节点 + 每张图一条节点；转发卡片失败自动退回 hybrid。
+        合并仍失败（或压缩不可用、体积压不进安全线）时降级为逐条发送。
 
         帧大小防线：RPC 帧上限 16MB（msgpack，真机实测 E_UNKNOWN 帧超限），
         合并载荷（含全部图片 base64）超过 11MB 安全线时先尝试压缩图片
-        （Pillow → JPEG 重编码，v1.3.1），压进安全线就继续走合并；
-        压不进（图太多或压缩不可用）才逐条发送。
+        （Pillow → JPEG 重编码，v1.3.1），压进安全线就继续走合并。
         """
         if not text and not image_b64s:
             return
@@ -533,39 +561,41 @@ class BiliPushPlugin(MaiBotPlugin):
         should_merge = threshold >= 0 and len(image_b64s) > threshold
         if should_merge and total_b64 > self.HYBRID_FRAME_SAFE_BYTES:
             # 超安全线：先压缩再合并（真机实测 hanser 9 图 35MB 逐条刷屏，
-            # 压缩到安全线内即可保住合并转发卡片的体验）
+            # 压缩到安全线内即可保住合并的体验）
             compressed = await self._compress_images_for_frame(image_b64s, where=where)
             if compressed is not None:
                 image_b64s = compressed
                 total_b64 = sum(len(b) for b in image_b64s) + len(text)
         should_merge = should_merge and total_b64 <= self.HYBRID_FRAME_SAFE_BYTES
         if should_merge:
-            # --- 第一优先：send.forward 合并转发卡片 ---
-            # Host 端（_cap_send_forward）节点格式：
-            #   {"nickname"/"user_nickname": str, "user_id": str,
-            #    "message_id": str(缺省自动生成), "segments": [{"type","content"}]}
-            # text 段取 content/data，image 段的 content 自动进 binary_data_base64
-            forward_nodes: list[dict[str, Any]] = []
-            if text:
-                forward_nodes.append({
-                    "user_id": "",
-                    "nickname": sender_name or "B站动态",
-                    "segments": [{"type": "text", "content": text}],
-                })
-            for b64 in image_b64s:
-                forward_nodes.append({
-                    "user_id": "",
-                    "nickname": sender_name or "B站动态",
-                    "segments": [{"type": "image", "content": b64}],
-                })
-            try:
-                await self.ctx.send.forward(forward_nodes, stream_id)
-                return
-            except Exception as exc:
-                self.ctx.logger.warning(
-                    "%s 合并转发卡片发送失败，尝试混合消息: %s", where, exc
-                )
-            # --- 第二优先：send.hybrid 单条图文混合 ---
+            use_forward_card = len(image_b64s) > self.FORWARD_CARD_MIN_IMAGES
+            if use_forward_card:
+                # --- 多图：send.forward 合并转发卡片 ---
+                # Host 端（_cap_send_forward）节点格式：
+                #   {"nickname"/"user_nickname": str, "user_id": str,
+                #    "message_id": str(缺省自动生成), "segments": [{"type","content"}]}
+                # text 段取 content/data，image 段的 content 自动进 binary_data_base64
+                forward_nodes: list[dict[str, Any]] = []
+                if text:
+                    forward_nodes.append({
+                        "user_id": "",
+                        "nickname": sender_name or "B站动态",
+                        "segments": [{"type": "text", "content": text}],
+                    })
+                for b64 in image_b64s:
+                    forward_nodes.append({
+                        "user_id": "",
+                        "nickname": sender_name or "B站动态",
+                        "segments": [{"type": "image", "content": b64}],
+                    })
+                try:
+                    await self.ctx.send.forward(forward_nodes, stream_id)
+                    return
+                except Exception as exc:
+                    self.ctx.logger.warning(
+                        "%s 合并转发卡片发送失败，尝试混合消息: %s", where, exc
+                    )
+            # --- 单条图文混合（1~2 张图首选；多图转发卡片失败时兜底）---
             segments: list[dict[str, str]] = []
             if text:
                 segments.append({"type": "text", "content": text})
