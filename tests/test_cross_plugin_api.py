@@ -291,6 +291,19 @@ class _FakeClient:
         return self._items
 
 
+def test_subscriptions_shape_error_degrades_with_log(tmp_path, caplog):
+    """可达降级：subscriptions.json 被写成 JSON 数组 → .items() 抛错，必须降级且留痕。"""
+    (tmp_path / "subscriptions.json").write_text('["不是对象"]', encoding="utf-8")
+    plug = _plugin(tmp_path)          # SubscriptionStore 会读成 list
+    with caplog.at_level(logging.WARNING):
+        out = asyncio.run(plug.api_get_subscriptions())
+    assert out["up"] == [] and out["count"] == 0
+    assert "不可读" in out["reason"] or "降级" in out["reason"]
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
+        "订阅表形状异常被静默降级：日志里找不到痕迹（全检第 12 项）"
+    )
+
+
 # ---------------------------------------------------------------- 组件注册
 
 

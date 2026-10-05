@@ -1022,6 +1022,9 @@ class BiliPushPlugin(MaiBotPlugin):
                     }
                 )
         except Exception as exc:  # noqa: BLE001 —— 订阅表畸形时降级为空结果
+            # 可达场景：subscriptions.json 被写成 JSON 数组/dict 形状异常，
+            # _subs.data 不是 {uid: {...}}，.items() 直接抛错。留痕便于定位。
+            self.ctx.logger.warning("get_subscriptions 降级（订阅表不可读）：%r", exc)
             return {
                 "schema_version": 1,
                 "reason": f"订阅表不可读，已降级：{exc}",
@@ -1064,6 +1067,7 @@ class BiliPushPlugin(MaiBotPlugin):
             try:
                 pushes = self._push_log.recent(limit=limit, since_seconds=since_seconds)
             except Exception as exc:  # noqa: BLE001 —— 记录畸形时降级而非抛出
+                self.ctx.logger.warning("get_recent_pushes 降级（记录不可读）：%r", exc)
                 degraded = f"推送记录不可读，已降级：{exc}"
         if degraded:
             reason = degraded

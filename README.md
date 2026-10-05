@@ -131,7 +131,7 @@ users = [                # 固定订阅：UID => 群号1, 群号2
   `fixed=true` 表示该订阅来自配置行（不可被命令移除）。
 - 两个 API 都是纯新增 handler，不改任何既有行为 ⇒ 回滚只需停用消费方或发补丁版本。
 - 本版门禁实测（2026-10-05）：devkit `run_gates` PASS 2 / SKIP 0 / FAIL 0
-  （`check_plugin` PASS 37 / WARN 1 / FAIL 0、pytest 25 passed）；插件中心自查器
+  （`check_plugin` PASS 37 / WARN 1 / FAIL 0、pytest 26 passed）；插件中心自查器
   `check_submission.py` PASS 19 / FAIL 0 / WARN 2（其中 `h2` 依赖 WARN 来自随仓库的
   诊断脚本 `diagnose_bili.py`，属既有问题）。
 - 上线前全检（2026-10-05）修掉一条**推送语义**缺陷：推送记录写盘失败原本会冒泡，
