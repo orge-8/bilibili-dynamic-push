@@ -28,7 +28,7 @@ _MOD = importlib.import_module(_PLUGIN_DIR.name)
 if not hasattr(_MOD, "create_plugin"):
     _MOD = importlib.import_module(f"{_PLUGIN_DIR.name}.plugin")
 
-from subscription_store import PUSH_LOG_LIMIT, PushLog, SubscriptionStore  # noqa: E402
+from subscription_store import PUSH_LOG_LIMIT, PushHistory, PushLog, SubscriptionStore  # noqa: E402
 
 ALL_SUB_KEYS = {"schema_version", "reason", "active", "count", "up"}
 ALL_UP_KEYS = {"uid", "name", "groups", "fixed"}
@@ -255,6 +255,40 @@ def test_recent_pushes_readonly(tmp_path):
     after = path.stat()
     assert path.read_bytes() == before, "只读 API 不得改写记录"
     assert (after.st_mtime, after.st_size) == (stats.st_mtime, stats.st_size)
+
+
+def test_log_write_failure_does_not_repeat_push(tmp_path):
+    """全检发现：推送记录写盘失败**不得**中断推送流水线。
+
+    `_push_log.append` 位于 `_check_uid` 里"推送"与"推进基准 set_last"之间。
+    若它的异常冒泡，基准就不推进 ⇒ 下一轮轮询会把**同一条动态再推一遍**
+    （群内重复消息），而且每次轮询都重复，直到磁盘恢复。
+    """
+    plug = _plugin(tmp_path)
+    _wire_push(plug)
+    plug._hist = PushHistory(str(tmp_path))
+    asyncio.run(plug._subs.add("114514", 12345))
+    asyncio.run(plug._hist.set_last("114514", "100"))  # 已有基准
+
+    plug._client = _FakeClient([_item(dyn_id="200", pub_ts=time.time())])
+
+    async def _boom(**kwargs):
+        raise OSError("磁盘只读")
+
+    plug._push_log.append = _boom  # type: ignore[assignment]
+
+    asyncio.run(plug._check_uid("114514"))  # 当前实现：OSError 冒泡 → 用例红
+    assert plug._hist.get("114514").get("dyn_id") == "200", (
+        "推送记录写盘失败后基准没有推进：下轮会重复推送同一条动态"
+    )
+
+
+class _FakeClient:
+    def __init__(self, items):
+        self._items = items
+
+    async def fetch_dynamics(self, uid):
+        return self._items
 
 
 # ---------------------------------------------------------------- 组件注册

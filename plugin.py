@@ -758,15 +758,26 @@ class BiliPushPlugin(MaiBotPlugin):
 
         # 推送成功那一刻记一条有界记录（至少一个群真的发出去了才记）——
         # push_history 只存 dyn_id，没有标题/链接，事后无法还原"推了什么"。
+        #
+        # 这里**必须**吞掉自己的异常：本方法在 _check_uid 里位于"推送"与
+        # "推进基准 set_last"之间，异常冒泡会让基准不推进 ⇒ 下一轮把同一条动态
+        # 再推一遍（群内重复消息），且每轮都重复。记录只是旁路，绝不能反过来
+        # 改变推送语义；失败的原因必须打出来（静默降级 = 故障隐形）。
         if record and sent and self._push_log is not None:
-            video = parsed.get("video") or {}
-            await self._push_log.append(
-                uid=uid,
-                name=name,
-                dyn_type=str(item.get("type") or ""),
-                title=video.get("title") or parsed.get("text") or "",
-                url=self._video_entry_url(parsed),
-            )
+            try:
+                video = parsed.get("video") or {}
+                await self._push_log.append(
+                    uid=uid,
+                    name=name,
+                    dyn_type=str(item.get("type") or ""),
+                    title=video.get("title") or parsed.get("text") or "",
+                    url=self._video_entry_url(parsed),
+                )
+            except Exception as exc:  # noqa: BLE001 - 记录失败不得中断推送流水线
+                self.ctx.logger.warning(
+                    "推送记录写入失败（UID %s 动态 %s），本轮仍推进基准、不重复推送：%r",
+                    uid, parsed.get("id"), exc,
+                )
 
     # ---------- 命令 ----------
 
