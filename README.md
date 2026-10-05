@@ -130,6 +130,14 @@ users = [                # 固定订阅：UID => 群号1, 群号2
 - `get_subscriptions` 的 `name` 为空就返回空串（**不猜**、不用 uid 顶替）；
   `fixed=true` 表示该订阅来自配置行（不可被命令移除）。
 - 两个 API 都是纯新增 handler，不改任何既有行为 ⇒ 回滚只需停用消费方或发补丁版本。
+- 本版门禁实测（2026-10-05）：devkit `run_gates` PASS 2 / SKIP 0 / FAIL 0
+  （`check_plugin` PASS 37 / WARN 1 / FAIL 0、pytest 24 passed）；插件中心自查器
+  `check_submission.py` PASS 19 / FAIL 0 / WARN 2（其中 `h2` 依赖 WARN 来自随仓库的
+  诊断脚本 `diagnose_bili.py`，属既有问题）。
+- **注意**：本仓库的冒烟脚本是**根目录**的 `smoke_test.py`（不在 `tests/`），devkit
+  门禁不会把它计为一个步骤。手动跑：`python smoke_test.py` → `ALL SMOKE TESTS PASSED`；
+  它末段会打真实 B 站接口，受风控/限流影响偶有波动（重跑即可），确定性门禁请以
+  `pytest tests` 为准。
 
 ## v1.4.2 更新（上线前全检修复）
 
