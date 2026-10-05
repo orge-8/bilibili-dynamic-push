@@ -19,7 +19,7 @@ _PLUGIN_DIR = str(Path(__file__).resolve().parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Command, Field, MaiBotPlugin, PluginConfigBase
 
 from bili_client import (
     RISK_CODES,
@@ -31,7 +31,7 @@ from bili_client import (
     is_top_dynamic,
     parse_dynamic,
 )
-from subscription_store import PushHistory, SubscriptionStore
+from subscription_store import PushHistory, PushLog, SubscriptionStore
 
 # 风控退避上限（秒）。IP 被风控时指数拉长轮询间隔，但不超过 30 分钟，
 # 避免风控解除后长时间收不到动态。
@@ -202,6 +202,7 @@ class BiliPushPlugin(MaiBotPlugin):
         self._client: BiliClient | None = None
         self._subs: SubscriptionStore | None = None
         self._hist: PushHistory | None = None
+        self._push_log: PushLog | None = None
         self._task: asyncio.Task | None = None
         self._running = False
         self._last_poll_ts = 0.0
@@ -250,6 +251,7 @@ class BiliPushPlugin(MaiBotPlugin):
         data_dir = str(self.ctx.paths.data_dir)
         self._subs = SubscriptionStore(data_dir)
         self._hist = PushHistory(data_dir)
+        self._push_log = PushLog(data_dir)
         self._subs.sync_from_config(cfg.subscriptions.users)
         await self._subs.save()
         self._client = BiliClient(
@@ -699,7 +701,19 @@ class BiliPushPlugin(MaiBotPlugin):
             return parsed.get("orig_url") or parsed["url"]
         return parsed["url"]
 
-    async def _push_dynamic(self, uid: str, item: dict[str, Any], groups: list[int]) -> None:
+    async def _push_dynamic(
+        self,
+        uid: str,
+        item: dict[str, Any],
+        groups: list[int],
+        *,
+        record: bool = True,
+    ) -> None:
+        """解析并把一条动态推给目标群。
+
+        ``record=False`` 用于手动 `/dyn test` 自测——它推的是**旧动态**，
+        记进 `push_log.json` 会让消费方当成"UP 主刚发了新动态"（假世界事件）。
+        """
         assert self._subs is not None
         parsed = parse_dynamic(
             item, ignore_lottery=self.config.settings.ignore_lottery
@@ -722,6 +736,7 @@ class BiliPushPlugin(MaiBotPlugin):
             except Exception as exc:
                 self.ctx.logger.warning("图片下载失败 %s: %s", img_url, exc)
 
+        sent = 0
         for gid in groups:
             stream_id = await self._get_stream_id(gid)
             if not stream_id:
@@ -732,6 +747,7 @@ class BiliPushPlugin(MaiBotPlugin):
                     stream_id, text, image_b64s,
                     where=f"群 {gid}", sender_name=name,
                 )
+                sent += 1
             except Exception as exc:
                 self.ctx.logger.error("群 %s 发送文本失败: %s", gid, exc, exc_info=True)
             await asyncio.sleep(1.0)
@@ -739,6 +755,18 @@ class BiliPushPlugin(MaiBotPlugin):
         self.ctx.logger.info(
             "已推送 UID %s 动态 %s 到 %d 个群", uid, parsed["id"], len(groups)
         )
+
+        # 推送成功那一刻记一条有界记录（至少一个群真的发出去了才记）——
+        # push_history 只存 dyn_id，没有标题/链接，事后无法还原"推了什么"。
+        if record and sent and self._push_log is not None:
+            video = parsed.get("video") or {}
+            await self._push_log.append(
+                uid=uid,
+                name=name,
+                dyn_type=str(item.get("type") or ""),
+                title=video.get("title") or parsed.get("text") or "",
+                url=self._video_entry_url(parsed),
+            )
 
     # ---------- 命令 ----------
 
@@ -913,7 +941,7 @@ class BiliPushPlugin(MaiBotPlugin):
             if target is None:
                 return await self._reply(stream_id, "该 UP 主暂无可推送的普通动态。")
             if group_id:
-                await self._push_dynamic(arg, target, [int(group_id)])
+                await self._push_dynamic(arg, target, [int(group_id)], record=False)
                 return await self._reply(stream_id, "已推送测试动态到本群。")
             if stream_id:
                 # 私聊测试：推文本 + 图片到当前会话（与群聊推送格式一致，
@@ -946,6 +974,102 @@ class BiliPushPlugin(MaiBotPlugin):
             "❓ /dyn help  本帮助"
         )
         return await self._reply(stream_id, help_text)
+
+    # ---------- 跨插件只读 API ----------
+
+    @API(
+        "get_subscriptions",
+        version="1",
+        public=True,
+        description="只读查询订阅的 UP 主列表（零网络零写盘）",
+    )
+    async def api_get_subscriptions(self, **kwargs: Any) -> dict[str, Any]:
+        """只读暴露订阅表（``subscriptions.json``），供其他插件轮询。
+
+        契约纪律：结构永远完整 + ``reason``；``name`` 为空就返回空串
+        （**不猜、不用 uid 顶替**）；``fixed`` 如实保留（配置行订阅不可被命令移除）；
+        纯 dict 不抛异常；零网络零写盘。
+        """
+        up: list[dict[str, Any]] = []
+        try:
+            subs = self._subs.data if self._subs is not None else {}
+            for uid, entry in (subs or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                groups: list[int] = []
+                for g in entry.get("groups") or []:
+                    try:
+                        groups.append(int(g))
+                    except (TypeError, ValueError):
+                        continue
+                up.append(
+                    {
+                        "uid": str(uid),
+                        "name": str(entry.get("name") or ""),
+                        "groups": groups,
+                        "fixed": bool(entry.get("fixed")),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 —— 订阅表畸形时降级为空结果
+            return {
+                "schema_version": 1,
+                "reason": f"订阅表不可读，已降级：{exc}",
+                "active": self._subs is not None,
+                "count": 0,
+                "up": [],
+            }
+        if self._subs is None:
+            reason = "插件尚未完成启动（订阅存储未就绪）"
+        elif not up:
+            reason = "暂无订阅"
+        else:
+            reason = ""
+        return {
+            "schema_version": 1,
+            "reason": reason,
+            "active": self._subs is not None,
+            "count": len(up),
+            "up": up,
+        }
+
+    @API(
+        "get_recent_pushes",
+        version="1",
+        public=True,
+        description="只读查询最近推送成功的动态（零网络零写盘）",
+    )
+    async def api_get_recent_pushes(
+        self, limit: int = 10, since_seconds: int = 0, **kwargs: Any
+    ) -> dict[str, Any]:
+        """只读暴露最近推送记录（``push_log.json``），供其他插件轮询。
+
+        ``limit`` 钳到 1..100，最新在前；``since_seconds > 0`` 时只回时间窗内记录。
+        每条只含结构性元数据 ``uid / name / dyn_type / title / url / at``——
+        ``title`` 已截断到 120 字并去掉换行，聊天原文不入库。
+        """
+        pushes: list[dict[str, Any]] = []
+        degraded = ""
+        if self._push_log is not None:
+            try:
+                pushes = self._push_log.recent(limit=limit, since_seconds=since_seconds)
+            except Exception as exc:  # noqa: BLE001 —— 记录畸形时降级而非抛出
+                degraded = f"推送记录不可读，已降级：{exc}"
+        if degraded:
+            reason = degraded
+        elif self._push_log is None:
+            reason = "插件尚未完成启动（推送记录未就绪）"
+        elif self._push_log.count == 0:
+            reason = "暂无推送记录"
+        elif not pushes:
+            reason = "时间窗内没有推送记录"
+        else:
+            reason = ""
+        return {
+            "schema_version": 1,
+            "reason": reason,
+            "active": self._push_log is not None,
+            "pushes": pushes,
+        }
 
 
 # ================================================================ WebUI 显示层补丁

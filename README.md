@@ -111,6 +111,26 @@ users = [                # 固定订阅：UID => 群号1, 群号2
 - **模板自动迁移**：老版本部署的 `config.toml` 会把旧模板（带链接）写死在配置里，插件升级后代码默认值变了、配置文件不会跟着变。v1.1.1 起插件会在加载时自动识别"未改过的旧默认模板"并迁移为图文直推格式（自定义过的模板原样保留）。若想彻底回到默认，直接删掉 `config.toml` 里的 `push_text_template` 行让插件重新生成即可。
 - **私聊 `/dyn test`** 也会推送图片，方便你在不打扰群的情况下预览完整效果。
 
+## v1.5.0 更新（跨插件只读 API）
+
+新增两个**只读**跨插件 API，供其他插件（首个消费方：life-frequency 的"外面的世界"事件）
+读取本插件的既有状态。两者都**零网络、零写盘、不改既有行为**、结构永远完整 + `reason`：
+
+| API | 参数 | 返回 |
+|---|---|---|
+| `get_subscriptions` | 无 | `{schema_version, reason, active, count, up: [{uid, name, groups, fixed}]}` |
+| `get_recent_pushes` | `limit=10`、`since_seconds=0` | `{schema_version, reason, active, pushes: [{uid, name, dyn_type, title, url, at}]}` |
+
+- **`push_log.json`（新增）**：`push_history.json` 只存 `dyn_id`（去重基准）、没有标题/链接，
+  回答不了"最近推了什么"。本版在**推送成功那一刻**追加一条有界记录（环形上限 50 条，
+  超出丢最旧），字段只有 `uid / name / dyn_type / title / url / at`；
+  `title` 入库前截断到 120 字并去掉换行（外部文本，永不入库聊天原文）。
+- **手动 `/dyn test` 不记录**（`record=False`）：它推的是**旧动态**，记了会被消费方
+  当成"UP 主刚发了新动态"（假世界事件）。发送失败 / 无目标群同样不记。
+- `get_subscriptions` 的 `name` 为空就返回空串（**不猜**、不用 uid 顶替）；
+  `fixed=true` 表示该订阅来自配置行（不可被命令移除）。
+- 两个 API 都是纯新增 handler，不改任何既有行为 ⇒ 回滚只需停用消费方或发补丁版本。
+
 ## v1.4.2 更新（上线前全检修复）
 
 - **`ignore_lottery` 配置项真正生效**：此前版本该配置从未被读取，开奖动态始终被过滤；
@@ -189,8 +209,9 @@ users = [                # 固定订阅：UID => 群号1, 群号2
 
 - `data/plugins/org.mai-mai.bilibili-dynamic-push/subscriptions.json` - 订阅关系
 - `data/plugins/org.mai-mai.bilibili-dynamic-push/push_history.json` - 已推送动态 ID（去重基准）
+- `data/plugins/org.mai-mai.bilibili-dynamic-push/push_log.json` - 最近推送记录（有界环形，上限 50 条；v1.5.0 新增，供跨插件只读查询）
 
-两者自动维护，请勿手改（损坏会自动备份为 `.broken` 并重建）。
+三者自动维护，请勿手改（损坏会自动备份为 `.broken` 并重建）。
 
 ## 风控与接口实测结论（重要）
 
