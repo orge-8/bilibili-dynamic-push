@@ -48,6 +48,13 @@ async def rpc_call(method, plugin_id, payload, timeout_ms=None):
             ("hybrid", f"<{len(segs)} segs: " + ",".join(s.get("type", "?") for s in segs) + ">")
         )
         return True
+    if cap == "chat.get_stream_by_group_id":
+        # 真实群流：带 chat_type=group 与非空 group_id（可通过目标校验）
+        return {
+            "stream_id": f"stream-group-{args.get('group_id')}",
+            "chat_type": "group",
+            "group_id": args.get("group_id"),
+        }
     if cap == "chat.open_session":
         return {"stream_id": f"stream-group-{args.get('group_id')}"}
     if cap.startswith("config."):
@@ -526,6 +533,48 @@ async def main():
     assert "私聊测试动态" in r[1], r[1]
     print(f"  -> 私聊 test 单图合并为一条混合消息: {kinds}")
 
+    # v1.5.1：群聊 /dyn test 的回执必须反映**真实送达**结果
+    # （此前无条件下发「已推送测试动态到本群。」，真机群里其实一条都没收到）
+    plug._client.fetch_dynamics = stub_fetch
+    plug._download_image_b64 = stub_dl
+    try:
+        r_ok = await plug.cmd_dyn(
+            matched_groups={"action": "test", "arg": "123"},
+            stream_id="s-1", group_id="12345",
+        )
+        assert "确认送达" in r_ok[1], f"群聊 test 成功回执应含送达计数: {r_ok[1]}"
+
+        # 适配器 DROPPED（send 返回 False）-> 必须回失败，不得再报"已推送"
+        # 注意：带图动态走 hybrid/forward，三种通道都要打桩才算"全部丢弃"
+        orig_text2 = plug.ctx.send.text
+        orig_hybrid2 = plug.ctx.send.hybrid
+        orig_fwd2 = plug.ctx.send.forward
+        orig_img2 = plug.ctx.send.image
+
+        async def dropped2(*a, **kw):
+            return False
+
+        plug.ctx.send.text = dropped2  # type: ignore[method-assign]
+        plug.ctx.send.hybrid = dropped2  # type: ignore[method-assign]
+        plug.ctx.send.forward = dropped2  # type: ignore[method-assign]
+        plug.ctx.send.image = dropped2  # type: ignore[method-assign]
+        plug._group_stream_cache.pop("12345", None)
+        try:
+            r_bad = await plug.cmd_dyn(
+                matched_groups={"action": "test", "arg": "123"},
+                stream_id="s-1", group_id="12345",
+            )
+        finally:
+            plug.ctx.send.text = orig_text2  # type: ignore[method-assign]
+            plug.ctx.send.hybrid = orig_hybrid2  # type: ignore[method-assign]
+            plug.ctx.send.forward = orig_fwd2  # type: ignore[method-assign]
+            plug.ctx.send.image = orig_img2  # type: ignore[method-assign]
+        assert "未能确认送达" in r_bad[1], f"未送达时不得回成功: {r_bad[1]}"
+    finally:
+        plug._client.fetch_dynamics = orig_fetch
+        plug._download_image_b64 = orig_dl
+    print("  -> 群聊 test 回执按真实送达结果给出（成功/失败两态）")
+
     print("== 有图片就合并：1 条 forward 转发卡片（v1.4.0 默认阈值 0）==")
     # 用户需求：只要有图片，文字+图片就合并成一条消息（不再按张数区分）
     merge_item = {
@@ -987,6 +1036,71 @@ async def main():
         assert "517327498" in r[1], "回复应包含 UID"
     except Exception as exc:
         print(f"  [跳过] 网络不可用: {type(exc).__name__}: {exc}")
+
+    print("== v1.5.1 回归：会话目标校验 + 发送结果校验（真机 missing_target_id）==")
+    # 背景：snowluma-adapter 上 open_session 返回 chat_type=private / target_id 为空的流，
+    # 往该流 send 会被 adapter_policy: missing_target_id 直接 DROPPED，SDK 只返回
+    # False、不抛异常 —— 插件此前照旧计成"已推送"（假成功日志的根源）。
+
+    # ① 目标校验判据（字段缺失时不下结论，避免误伤正常适配器）
+    assert plug._stream_target_problem({"chat_type": "group", "group_id": "12345"}) == ""
+    assert plug._stream_target_problem({"stream_id": "s-1"}) == "", "字段缺失时不应下结论"
+    assert plug._stream_target_problem({"chat_type": "private", "target_id": ""}), (
+        "private + 空 target 应判定异常"
+    )
+    assert plug._stream_target_problem({"chat_type": "group", "group_id": ""}), (
+        "group_id 为空应判定异常"
+    )
+
+    # ② open_session 给出坏流 -> 拿不到可用会话，一次都不发（不再静默丢弃）
+    orig_get = plug.ctx.chat.get_stream_by_group_id
+    orig_open = plug.ctx.chat.open_session
+
+    async def no_group_stream(group_id, platform="qq"):
+        return None
+
+    async def bad_open(platform="qq", chat_type="private", **kw):
+        return {"stream_id": "stream-bad", "chat_type": "private", "target_id": ""}
+
+    plug.ctx.chat.get_stream_by_group_id = no_group_stream
+    plug.ctx.chat.open_session = bad_open
+    try:
+        sid = await plug._get_stream_id(999)
+        assert sid == "", f"坏会话不应返回 stream_id: {sid!r}"
+        assert "999" not in plug._group_stream_cache, "坏会话不应写入缓存"
+        SENT.clear()
+        await plug._push_dynamic("114514", no_img, [999])
+        assert SENT == [], f"没有可用会话时不应尝试发送: {SENT}"
+    finally:
+        plug.ctx.chat.get_stream_by_group_id = orig_get
+        plug.ctx.chat.open_session = orig_open
+
+    # ③ send 返回 False（适配器 DROPPED）-> 不计成功，且刷新会话重试一次
+    plug._group_stream_cache.pop("12345", None)
+    orig_text = plug.ctx.send.text
+    drop_calls: list[str] = []
+
+    async def dropped_text(text, stream_id, **kw):
+        drop_calls.append(stream_id)
+        return False
+
+    plug.ctx.send.text = dropped_text  # type: ignore[method-assign]
+    before = plug._push_log.count
+    try:
+        await plug._push_dynamic("114514", no_img, [12345], record=True)
+    finally:
+        plug.ctx.send.text = orig_text  # type: ignore[method-assign]
+    assert len(drop_calls) == 2, (
+        f"未确认送达应刷新会话重试 1 次，实际调用 {len(drop_calls)} 次"
+    )
+    assert plug._push_log.count == before, "未确认送达不应写入推送成功记录（假成功）"
+
+    # ④ send 返回 True -> 正常计入成功并写记录
+    plug._group_stream_cache.pop("12345", None)
+    before2 = plug._push_log.count
+    await plug._push_dynamic("114514", no_img, [12345], record=True)
+    assert plug._push_log.count == before2 + 1, "确认送达应写入推送记录"
+    print("  -> 坏会话不发送、DROPPED 重试且不计成功、确认送达才写记录")
 
     print("== on_unload ==")
     await plug.on_unload()

@@ -74,13 +74,14 @@ def _wire_push(plug, *, fail=False):
     """把 _push_dynamic 的外围协作对象换成桩，返回记录调用次数的容器。"""
     calls = {"sent": 0}
 
-    async def _stream_id(group_id):
+    async def _stream_id(group_id, *, refresh=False):
         return f"stream-{group_id}"
 
     async def _send(stream_id, text, image_b64s, *, where, sender_name):
         calls["sent"] += 1
         if fail:
             raise RuntimeError("模拟发送失败")
+        return True
 
     plug._get_stream_id = _stream_id            # type: ignore[assignment]
     plug._send_dynamic_content = _send          # type: ignore[assignment]

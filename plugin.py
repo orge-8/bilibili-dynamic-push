@@ -2,7 +2,11 @@
 
 参考 beimyu504/beiyu_bilibili-dynamic-push 的订阅/去重/置顶识别设计，
 改为 web 端 polymer API 直连（不依赖 bilibili-api-python），
-推送走 SDK 能力代理（chat.open_session + send.text / send.image）。
+推送走 SDK 能力代理（chat.get_stream_by_group_id / chat.open_session +
+send.text / send.image / send.hybrid / send.forward）。
+
+v1.5.1：send.* 的返回值必须校验（适配器 DROPPED 时只返回 False、不抛异常），
+且成功日志只记**实际确认送达**的群数——详见 README「v1.5.1 更新」。
 """
 
 import asyncio
@@ -449,23 +453,89 @@ class BiliPushPlugin(MaiBotPlugin):
 
     # ---------- 推送 ----------
 
-    async def _get_stream_id(self, group_id: int) -> str:
-        """群号 -> stream_id（带缓存）。"""
+    async def _get_stream_id(self, group_id: int, *, refresh: bool = False) -> str:
+        """群号 -> stream_id（带缓存）。
+
+        v1.5.1：snowluma-adapter 上 `chat.open_session` 会返回一个
+        chat_type 降级为 private、target_id 为空的流；往这种流发消息会被适配器
+        策略以 ``missing_target_id`` 直接 DROPPED（真机 2026-10-16 23:36:32
+        实录），而 SDK 的 send.* 只返回 False、不抛异常，插件因此把丢弃当成成功。
+        修法：优先用 ``chat.get_stream_by_group_id`` 取真实群流，取不到才回退
+        open_session，且回退结果做目标校验——目标异常的流不缓存、不返回，
+        让调用方按"拿不到有效会话"处理并记 error。
+        """
         key = str(group_id)
-        cached = self._group_stream_cache.get(key)
-        if cached:
-            return cached
-        stream = await self.ctx.chat.open_session(
-            platform="qq", chat_type="group", group_id=key
-        )
-        stream_id = ""
-        if isinstance(stream, dict):
-            stream_id = str(stream.get("stream_id") or stream.get("id") or "")
-        elif stream is not None:
-            stream_id = str(stream)
-        if stream_id:
-            self._group_stream_cache[key] = stream_id
+        if not refresh:
+            cached = self._group_stream_cache.get(key)
+            if cached:
+                return cached
+
+        # 1) 优先复用已存在的真实群流（不新建会话，避免造出空 target 的流）
+        try:
+            stream = await self.ctx.chat.get_stream_by_group_id(key, platform="qq")
+        except Exception as exc:  # noqa: BLE001 - 该能力缺失/报错不应中断推送
+            self.ctx.logger.warning("群 %s 查询群流失败（%s），回退 open_session", key, exc)
+        else:
+            stream_id = self._extract_stream_id(stream)
+            if stream_id and not self._stream_target_problem(stream):
+                self._group_stream_cache[key] = stream_id
+                return stream_id
+
+        # 2) 回退：开/建会话
+        try:
+            stream = await self.ctx.chat.open_session(
+                platform="qq", chat_type="group", group_id=key
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.error("群 %s open_session 失败: %s", key, exc, exc_info=True)
+            return ""
+
+        stream_id = self._extract_stream_id(stream)
+        if not stream_id:
+            self.ctx.logger.error("群 %s open_session 未返回 stream_id: %r", key, stream)
+            return ""
+        problem = self._stream_target_problem(stream)
+        if problem:
+            # 这种流发出的消息必被适配器丢弃（missing_target_id）——
+            # 不缓存、不返回，避免后续轮询反复复用坏流。
+            self.ctx.logger.error(
+                "群 %s 会话目标异常（%s）：该流发出的消息会被适配器丢弃，放弃本次会话",
+                key, problem,
+            )
+            return ""
+        self._group_stream_cache[key] = stream_id
         return stream_id
+
+    @staticmethod
+    def _extract_stream_id(stream: Any) -> str:
+        """从各种返回形态（dict / str / 对象）里取出 stream_id。"""
+        if isinstance(stream, dict):
+            return str(stream.get("stream_id") or stream.get("id") or "")
+        if isinstance(stream, (str, int)):
+            return str(stream)
+        for attr in ("stream_id", "id"):
+            val = getattr(stream, attr, None)
+            if val:
+                return str(val)
+        return ""
+
+    @staticmethod
+    def _stream_target_problem(stream: Any) -> str:
+        """返回会话目标的问题描述（空串 = 正常或无法判断）。
+
+        只在**明确**看到异常时才判定：chat_type 不是群聊，或适配器显式返回了
+        空的 target_id / group_id。返回体里没有这些字段时不下结论——不同适配器
+        返回结构差异大，误判会让原本正常的推送全部失败。
+        """
+        if not isinstance(stream, dict):
+            return ""
+        chat_type = str(stream.get("chat_type") or "").strip().lower()
+        if chat_type and chat_type not in ("group", "qq_group", "guild"):
+            return f"chat_type={chat_type}"
+        for field in ("target_id", "group_id"):
+            if field in stream and not str(stream.get(field) or "").strip():
+                return f"{field} 为空"
+        return ""
 
     async def _download_image_b64(self, url: str) -> str:
         assert self._client is not None
@@ -552,8 +622,13 @@ class BiliPushPlugin(MaiBotPlugin):
         *,
         where: str,
         sender_name: str = "",
-    ) -> None:
-        """把一条动态的文字+图片发到指定消息流。
+    ) -> bool:
+        """把一条动态的文字+图片发到指定消息流，返回**是否确认送达**。
+
+        v1.5.1：此前本方法返回 None 且不校验 send.* 的返回值。SDK 的 send.* 在
+        适配器 DROPPED 时只返回 False、不抛异常（真机 snowluma-adapter
+        ``adapter_policy: missing_target_id`` 实录），于是"消息被丢弃"也被调用方
+        计成推送成功。现在每一跳都校验送达结果，失败则向下一种形式降级。
 
         有图片（数量超过 hybrid_merge_threshold，默认 0 = 有图就合并）时
         合并为一条消息，按张数选择形式：
@@ -567,7 +642,7 @@ class BiliPushPlugin(MaiBotPlugin):
         （Pillow → JPEG 重编码，v1.3.1），压进安全线就继续走合并。
         """
         if not text and not image_b64s:
-            return
+            return False
         threshold = self.config.settings.hybrid_merge_threshold
         total_b64 = sum(len(b) for b in image_b64s) + len(text)
         should_merge = threshold >= 0 and len(image_b64s) > threshold
@@ -601,11 +676,17 @@ class BiliPushPlugin(MaiBotPlugin):
                         "segments": [{"type": "image", "content": b64}],
                     })
                 try:
-                    await self.ctx.send.forward(forward_nodes, stream_id)
-                    return
+                    res = await self.ctx.send.forward(forward_nodes, stream_id)
                 except Exception as exc:
                     self.ctx.logger.warning(
                         "%s 合并转发卡片发送失败，尝试混合消息: %s", where, exc
+                    )
+                else:
+                    if self._send_ok(res, where, "forward"):
+                        return True
+                    self.ctx.logger.warning(
+                        "%s 合并转发卡片未确认送达（adapter 返回 %r），尝试混合消息",
+                        where, res,
                     )
             # --- 单条图文混合（1~2 张图首选；多图转发卡片失败时兜底）---
             segments: list[dict[str, str]] = []
@@ -614,11 +695,17 @@ class BiliPushPlugin(MaiBotPlugin):
             for b64 in image_b64s:
                 segments.append({"type": "image", "content": b64})
             try:
-                await self.ctx.send.hybrid(segments, stream_id)
-                return
+                res = await self.ctx.send.hybrid(segments, stream_id)
             except Exception as exc:
                 self.ctx.logger.warning(
                     "%s 合并消息发送失败，降级为逐条发送: %s", where, exc
+                )
+            else:
+                if self._send_ok(res, where, "hybrid"):
+                    return True
+                self.ctx.logger.warning(
+                    "%s 合并消息未确认送达（adapter 返回 %r），降级为逐条发送",
+                    where, res,
                 )
         elif threshold >= 0 and len(image_b64s) > threshold:
             self.ctx.logger.warning(
@@ -627,14 +714,58 @@ class BiliPushPlugin(MaiBotPlugin):
                 len(image_b64s),
             )
         # 逐条发送（未达合并阈值、体积超限，或合并降级到底）
+        text_ok = True
         if text:
-            await self.ctx.send.text(text, stream_id)
+            try:
+                res = await self.ctx.send.text(text, stream_id)
+            except Exception as exc:
+                self.ctx.logger.error(
+                    "%s 发送文本失败: %s", where, exc, exc_info=True
+                )
+                text_ok = False
+            else:
+                if not self._send_ok(res, where, "text"):
+                    self.ctx.logger.error(
+                        "%s 文本未确认送达（adapter 返回 %r）——"
+                        "常见原因：会话 target 为空被适配器丢弃", where, res,
+                    )
+                    text_ok = False
+        img_ok = False
         for b64 in image_b64s:
             try:
-                await self.ctx.send.image(b64, stream_id)
+                res = await self.ctx.send.image(b64, stream_id)
+                if self._send_ok(res, where, "image"):
+                    img_ok = True
+                else:
+                    self.ctx.logger.error(
+                        "%s 图片未确认送达（adapter 返回 %r）", where, res
+                    )
                 await asyncio.sleep(0.5)
             except Exception as exc:
                 self.ctx.logger.error("%s 发送图片失败: %s", where, exc)
+        if not image_b64s:
+            return text_ok
+        return text_ok or img_ok
+
+    def _send_ok(self, result: Any, where: str, kind: str) -> bool:
+        """判定一次 send.* 调用是否真的送达。
+
+        SDK 的 send.* 返回 ``bool | SendResult``；适配器 DROPPED 时返回 False
+        而**不抛异常**（真机 snowluma-adapter 实录），插件此前从不检查返回值，
+        于是"被丢弃"也被算成推送成功（假成功日志的根源）。
+        None 视为未知：不算成功（故不计入已推送），但也不会触发重试刷屏。
+        """
+        if isinstance(result, dict):
+            for key in ("sent", "ok", "success"):
+                if key in result:
+                    return bool(result.get(key))
+            return bool(result)
+        if result is None:
+            self.ctx.logger.warning(
+                "%s send.%s 返回 None（无法确认送达），按未确认处理", where, kind
+            )
+            return False
+        return bool(result)
 
     def _render_push_text(self, parsed: dict[str, Any], name: str) -> str:
         """按模板渲染推送文本。
@@ -708,8 +839,12 @@ class BiliPushPlugin(MaiBotPlugin):
         groups: list[int],
         *,
         record: bool = True,
-    ) -> None:
-        """解析并把一条动态推给目标群。
+    ) -> tuple[int, int]:
+        """解析并把一条动态推给目标群，返回 ``(确认送达群数, 目标群数)``。
+
+        v1.5.1：返回值供 `/dyn test` 给出**真实**回执——此前无论发送成败都回
+        「已推送测试动态到本群。」，用户无法据此判断推送是否真的送达（真机
+        2026-10-17：群里只看到这句回执、没有动态内容，但同一条动态走私聊能发）。
 
         ``record=False`` 用于手动 `/dyn test` 自测——它推的是**旧动态**，
         记进 `push_log.json` 会让消费方当成"UP 主刚发了新动态"（假世界事件）。
@@ -720,7 +855,7 @@ class BiliPushPlugin(MaiBotPlugin):
         )
         if parsed is None:
             self.ctx.logger.info("UID %s 动态 %s 解析为空或被过滤", uid, item.get("id_str"))
-            return
+            return 0, 0
 
         # UP 主显示名（订阅里缓存的名字优先）
         name = self._subs.get_name(uid) or parsed["author"]
@@ -737,24 +872,52 @@ class BiliPushPlugin(MaiBotPlugin):
                 self.ctx.logger.warning("图片下载失败 %s: %s", img_url, exc)
 
         sent = 0
+        failed: list[str] = []
         for gid in groups:
-            stream_id = await self._get_stream_id(gid)
-            if not stream_id:
-                self.ctx.logger.error("群 %s 无法获取 stream_id", gid)
-                continue
-            try:
-                await self._send_dynamic_content(
-                    stream_id, text, image_b64s,
-                    where=f"群 {gid}", sender_name=name,
-                )
+            ok = False
+            for attempt in (1, 2):
+                stream_id = await self._get_stream_id(gid, refresh=(attempt > 1))
+                if not stream_id:
+                    self.ctx.logger.error(
+                        "群 %s 第 %d 次获取有效会话失败", gid, attempt
+                    )
+                    if attempt == 1:
+                        continue
+                    break
+                try:
+                    ok = await self._send_dynamic_content(
+                        stream_id, text, image_b64s,
+                        where=f"群 {gid}", sender_name=name,
+                    )
+                except Exception as exc:
+                    self.ctx.logger.error(
+                        "群 %s 第 %d 次发送异常: %s", gid, attempt, exc, exc_info=True
+                    )
+                    ok = False
+                if ok:
+                    break
+                if attempt == 1:
+                    # 未确认送达：多半是会话 target 失效（适配器 missing_target_id）。
+                    # 丢弃缓存重新取流再试一次；仍失败才认定该群推送失败。
+                    self.ctx.logger.warning(
+                        "群 %s 第 1 次发送未确认送达，刷新会话后重试", gid
+                    )
+                    await asyncio.sleep(1.0)
+            if ok:
                 sent += 1
-            except Exception as exc:
-                self.ctx.logger.error("群 %s 发送文本失败: %s", gid, exc, exc_info=True)
+            else:
+                failed.append(str(gid))
             await asyncio.sleep(1.0)
 
-        self.ctx.logger.info(
-            "已推送 UID %s 动态 %s 到 %d 个群", uid, parsed["id"], len(groups)
-        )
+        if failed:
+            self.ctx.logger.error(
+                "推送结果 UID %s 动态 %s：成功 %d/%d 个群，失败群 %s",
+                uid, parsed["id"], sent, len(groups), ",".join(failed),
+            )
+        else:
+            self.ctx.logger.info(
+                "已推送 UID %s 动态 %s 到 %d 个群", uid, parsed["id"], sent
+            )
 
         # 推送成功那一刻记一条有界记录（至少一个群真的发出去了才记）——
         # push_history 只存 dyn_id，没有标题/链接，事后无法还原"推了什么"。
@@ -778,6 +941,8 @@ class BiliPushPlugin(MaiBotPlugin):
                     "推送记录写入失败（UID %s 动态 %s），本轮仍推进基准、不重复推送：%r",
                     uid, parsed.get("id"), exc,
                 )
+
+        return sent, len(groups)
 
     # ---------- 命令 ----------
 
@@ -952,8 +1117,21 @@ class BiliPushPlugin(MaiBotPlugin):
             if target is None:
                 return await self._reply(stream_id, "该 UP 主暂无可推送的普通动态。")
             if group_id:
-                await self._push_dynamic(arg, target, [int(group_id)], record=False)
-                return await self._reply(stream_id, "已推送测试动态到本群。")
+                sent_n, total_n = await self._push_dynamic(
+                    arg, target, [int(group_id)], record=False
+                )
+                if sent_n:
+                    return await self._reply(
+                        stream_id,
+                        f"已推送测试动态到本群（{sent_n}/{total_n} 个群确认送达）。",
+                    )
+                # 假成功回执会掩盖故障：此前无论成败都回「已推送测试动态到本群。」
+                return await self._reply(
+                    stream_id,
+                    "⚠️ 测试动态**未能确认送达**：群会话不可用或消息被适配器丢弃。"
+                    "请查插件日志（关键词：会话目标异常 / 成功 0/1）。"
+                    "走私聊能发、群聊发不出 ⇒ 适配器给的是空 target 会话。",
+                )
             if stream_id:
                 # 私聊测试：推文本 + 图片到当前会话（与群聊推送格式一致，
                 # 否则用户在私聊里永远看不到图片效果）
@@ -966,10 +1144,14 @@ class BiliPushPlugin(MaiBotPlugin):
                             image_b64s.append(await self._download_image_b64(img_url))
                         except Exception as exc:
                             self.ctx.logger.warning("图片下载失败 %s: %s", img_url, exc)
-                    await self._send_dynamic_content(
+                    ok = await self._send_dynamic_content(
                         stream_id, text, image_b64s,
                         where="私聊", sender_name=parsed["author"],
                     )
+                    if not ok:
+                        return await self._reply(
+                            stream_id, "⚠️ 测试动态未确认送达（适配器未返回结果）。"
+                        )
                     return True, text, 2
             return await self._reply(stream_id, "无法确定推送目标。")
 
